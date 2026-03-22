@@ -518,7 +518,7 @@ def build_position_value_table(
 def build_portfolio_value_series(position_values: pd.DataFrame, cash_series: pd.Series) -> pd.DataFrame:
     out = pd.DataFrame(index=position_values.index)
     out["portfolio_positions_value"] = position_values.sum(axis=1)
-    out["portfolio_cash"] = cash_series.reindex(out.index).fillna(method="ffill").fillna(0.0)
+    out["portfolio_cash"] = cash_series.reindex(out.index).ffill().fillna(0.0)
     out["portfolio_value"] = out["portfolio_positions_value"] + out["portfolio_cash"]
     return out
 
