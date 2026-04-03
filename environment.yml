@@ -1,0 +1,11 @@
+name: finance_env
+channels:
+  - conda-forge
+dependencies:
+  - python>=3.10
+  - pandas>=2.0
+  - numpy>=1.24
+  - matplotlib>=3.7
+  - pip
+  - pip:
+      - yfinance>=0.2.40
