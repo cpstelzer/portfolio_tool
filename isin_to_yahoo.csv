@@ -1,3 +1,17 @@
-ISIN,YahooTicker
-IE00B4L5Y983,IWDA.AS
-IE00BKX55T58,EQQQ.DE
+ISIN,YahooTicker,Name,Notes
+DE000A0N62E5,PHPD.AS,WisdomTree Physical Palladium ETC,Amsterdam EUR - VZLB.DE and JE00B1VS3002.SG both failed; PHPD.AS tracks identical palladium price in EUR
+IE00B3WJKG14,QDVE.DE,iShares S&P 500 IT Sector ETF,XETRA
+IE00B8FHGS14,IQQ0.DE,iShares Edge MSCI World Min Vol ETF,XETRA - MVOL.DE not found on Yahoo Finance
+DE000A0F5UH1,ISPA.DE,iShares STOXX Global Select Dividend 100 ETF,XETRA
+LU0488317701,CD91.DE,Amundi NYSE Arca Gold Bugs ETF (fka Lyxor),XETRA - merged into Amundi Dec 2023; data gap expected post-merger
+IE00BYPLS672,USPY.DE,L&G Cyber Security ETF,XETRA
+IE00B5V87390,CEBB.DE,iShares MSCI Russia ADR/GDR ETF,XETRA - suspended Mar 2022; position closed Mar 2020 so only 2019-2020 data needed
+IE00B1FZS798,IUSM.DE,iShares USD Treasury Bond 7-10Y ETF,XETRA
+IE00B2NPKV68,IUS7.DE,iShares JP Morgan USD EM Bond ETF,XETRA
+IE00B5BMR087,SXR8.DE,iShares Core S&P 500 ETF,XETRA
+IE00BKM4GZ66,IS3N.DE,iShares Core MSCI EM IMI ETF,XETRA
+IE00B4L5YX21,EUNN.DE,iShares Core MSCI Japan IMI ETF,XETRA
+IE00B4K48X80,IMAE.AS,iShares Core MSCI Europe ETF (Acc),Amsterdam - EUNK.DE had data gaps on Yahoo Finance
+IE00B9F5YL18,VGEJ.DE,Vanguard FTSE Dev Asia Pacific ex Japan ETF,XETRA
+IE00BF4RFH31,IUSN.DE,iShares MSCI World Small Cap ETF,XETRA
+LU3025345516,XEON.DE,Xtrackers EUR Overnight Rate Swap ETF (proxy),XETRA - EDEG.DE only launched Jun 2025 (no history); XEON.DE tracks same EUR overnight rate since 2007

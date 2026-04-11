@@ -73,7 +73,8 @@ def load_transactions(path: Path) -> pd.DataFrame:
     if missing:
         sys.exit(f"[ERROR] transaction file missing columns: {missing}")
 
-    df["date"] = pd.to_datetime(df["date"])
+    # Accept both DD.MM.YYYY (European) and YYYY-MM-DD (ISO) formats
+    df["date"] = pd.to_datetime(df["date"], dayfirst=True)
     df["shares"] = pd.to_numeric(df["shares"], errors="coerce")
 
     if "price" in df.columns:
@@ -124,9 +125,15 @@ def fetch_prices(tickers: list[str], start: str, end: str) -> pd.DataFrame:
         prices = raw[["Close"]]
         prices.columns = tickers
 
-    # Warn and drop tickers with >50 % missing values
+    # Warn and drop tickers with >85 % missing values.
+    # A higher threshold (vs the naive 50 %) is intentional: some holdings are
+    # legitimately closed or suspended mid-period (e.g. Russia ETF suspended
+    # 2022, Gold Bugs fund merged 2023) but still need prices for the earlier
+    # dates when the position was actually held.  After ffill, those tickers
+    # will carry their last known price forward, which is harmless because the
+    # portfolio reconstruction contributes 0 from a position once it is sold.
     frac_missing = prices.isna().mean()
-    bad = frac_missing[frac_missing > 0.5].index.tolist()
+    bad = frac_missing[frac_missing > 0.85].index.tolist()
     if bad:
         warnings.warn(f"[WARN] Dropping tickers with insufficient data: {bad}", stacklevel=2)
         prices = prices.drop(columns=bad)
