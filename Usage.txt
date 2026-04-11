@@ -13,3 +13,49 @@ python portfolio_model.py transaction.csv isin_to_yahoo.csv \
     --start_date 2022-01-01 \
     --end_date 2024-12-31 \
     --export_csv results.csv
+
+# ---------------------------------------------------------------------------
+# Trading alternative assets (no ISIN): gold, silver, crypto, FX, futures
+# ---------------------------------------------------------------------------
+#
+# The transaction file supports an optional `ticker` column. When it is set,
+# the value is used directly as a Yahoo Finance symbol and the ISIN lookup
+# is bypassed for that row. This lets you mix ISIN-based holdings (ETFs,
+# stocks) with assets that have no ISIN (cryptocurrencies, precious metals,
+# futures contracts).
+#
+# Required columns:  date, shares            (+ either ISIN or ticker)
+# Optional columns:  price, gross_amount, name, ticker, ISIN
+#
+# Every row must have EITHER an ISIN (resolved via the lookup file) OR a
+# non-empty ticker. The `shares` field is interpreted as "units held":
+#   - shares    for equities / ETFs
+#   - coin units for cryptocurrencies (fractional amounts supported)
+#   - troy ounces / contracts for gold futures (GC=F)
+#
+# Example transaction.csv with mixed asset classes:
+#
+#     date,ISIN,ticker,shares,price
+#     2023-01-15,IE00B5BMR087,,10,375.40       # iShares Core S&P 500 ETF
+#     2023-04-10,,BTC-USD,0.25,28050.00        # 0.25 BTC at $28,050
+#     2023-05-20,,GC=F,15,2010.50              # 15 oz gold futures
+#     2024-08-14,,ETH-USD,2.5,2950.00          # 2.5 ETH at $2,950
+#
+# Common Yahoo Finance symbols for non-ISIN assets:
+#     BTC-USD    Bitcoin (USD)
+#     ETH-USD    Ethereum (USD)
+#     SOL-USD    Solana (USD)
+#     GC=F       Gold futures
+#     SI=F       Silver futures
+#     CL=F       WTI crude oil futures
+#     EURUSD=X   EUR/USD spot FX
+#
+# The lookup file is optional when every row in the transaction file has
+# a direct ticker (e.g. a crypto-only portfolio):
+#
+#     python portfolio_model.py crypto_transactions.csv --benchmark BTC-USD
+#
+# Note on spike filtering: cryptocurrencies routinely move >15% in a single
+# day, so a relaxed 50% single-day threshold is applied to symbols matching
+# the common crypto pair patterns (-USD, -EUR, -USDT, -BTC, -ETH, -GBP, -JPY).
+# Equity/ETF tickers continue to use the original 15% threshold.
