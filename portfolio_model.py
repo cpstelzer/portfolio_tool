@@ -7,10 +7,21 @@ compares it against a configurable benchmark ETF.
 Returns are computed as Time-Weighted Returns (TWR), which isolate
 price-driven growth from the mechanical effect of capital injections.
 
+Assets can be identified in two ways:
+  • ISIN   — a 12-character identifier mapped to a Yahoo Finance ticker
+             via the lookup file (e.g. IE00B5BMR087 → SXR8.DE). Used for
+             most equities, ETFs and bonds.
+  • ticker — a Yahoo Finance symbol used directly, for assets that have
+             no ISIN. Examples: BTC-USD (Bitcoin), ETH-USD (Ethereum),
+             GC=F (gold futures), SI=F (silver futures).
+
 Usage:
     python portfolio_model.py transaction.csv isin_to_yahoo.csv \
         --benchmark VWCE.DE \
         --buy_and_hold true
+
+    # Crypto-only portfolio (no lookup file required)
+    python portfolio_model.py crypto_transactions.csv --benchmark BTC-USD
 """
 
 from __future__ import annotations
@@ -36,7 +47,18 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         description="Reconstruct portfolio performance and compare to a benchmark."
     )
     parser.add_argument("transaction_file", type=Path, help="Path to transaction.csv")
-    parser.add_argument("lookup_file", type=Path, help="Path to isin_to_yahoo.csv")
+    parser.add_argument(
+        "lookup_file",
+        type=Path,
+        nargs="?",
+        default=None,
+        help=(
+            "Path to isin_to_yahoo.csv (optional). Only required when "
+            "transactions identify assets by ISIN. Portfolios that use "
+            "direct Yahoo tickers (crypto, commodities, etc.) for every "
+            "row can omit this argument."
+        ),
+    )
     parser.add_argument(
         "--benchmark",
         default="VWCE.DE",
@@ -63,7 +85,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 # 2. Data loading & validation
 # ---------------------------------------------------------------------------
 
-REQUIRED_TX_COLS = {"date", "ISIN", "shares"}
+REQUIRED_TX_COLS = {"date", "shares"}
 REQUIRED_LOOKUP_COLS = {"ISIN", "YahooTicker"}
 
 
@@ -73,8 +95,44 @@ def load_transactions(path: Path) -> pd.DataFrame:
     if missing:
         sys.exit(f"[ERROR] transaction file missing columns: {missing}")
 
-    # Accept both DD.MM.YYYY (European) and YYYY-MM-DD (ISO) formats
-    df["date"] = pd.to_datetime(df["date"], dayfirst=True)
+    # Each transaction must identify the asset via ISIN (looked up) or
+    # ticker (used directly). At least one of the two columns must exist.
+    if "ISIN" not in df.columns and "ticker" not in df.columns:
+        sys.exit(
+            "[ERROR] transaction file must contain either an 'ISIN' column "
+            "(resolved via the lookup file) or a 'ticker' column (used as a "
+            "Yahoo Finance symbol directly for assets without an ISIN, e.g. "
+            "BTC-USD, GC=F)."
+        )
+
+    # Normalise identifier columns to stripped strings; missing → "".
+    for col in ("ISIN", "ticker"):
+        if col not in df.columns:
+            df[col] = ""
+        df[col] = df[col].fillna("").astype(str).str.strip()
+
+    empty_ids = (df["ISIN"] == "") & (df["ticker"] == "")
+    if empty_ids.any():
+        bad = (df.index[empty_ids] + 2).tolist()  # +2 for header row + 0-based
+        sys.exit(
+            f"[ERROR] transaction rows {bad} have neither 'ISIN' nor 'ticker' "
+            "set. Every row must provide one of them."
+        )
+
+    # Accept both DD.MM.YYYY (European) and YYYY-MM-DD (ISO) formats.
+    # Try ISO first then fall back to European DD.MM.YYYY. This is explicit
+    # per-row so ambiguous ISO strings like "2022-01-03" are not misread as
+    # 1 March 2022 under dayfirst=True.
+    raw_dates = df["date"].astype(str).str.strip()
+    iso = pd.to_datetime(raw_dates, format="%Y-%m-%d", errors="coerce")
+    eu = pd.to_datetime(raw_dates, format="%d.%m.%Y", errors="coerce")
+    df["date"] = iso.fillna(eu)
+    if df["date"].isna().any():
+        bad = (df.index[df["date"].isna()] + 2).tolist()
+        sys.exit(
+            f"[ERROR] Unparseable dates in rows {bad}. "
+            "Use YYYY-MM-DD (ISO) or DD.MM.YYYY (European)."
+        )
     df["shares"] = pd.to_numeric(df["shares"], errors="coerce")
 
     if "price" in df.columns:
@@ -99,9 +157,49 @@ def load_lookup(path: Path) -> dict[str, str]:
     return dict(zip(df["ISIN"], df["YahooTicker"]))
 
 
+def resolve_tickers(
+    transactions: pd.DataFrame,
+    isin_to_ticker: dict[str, str],
+) -> pd.Series:
+    """
+    Return a Series (aligned to ``transactions.index``) giving the Yahoo
+    Finance symbol each transaction should use, or ``None`` if it cannot
+    be resolved.
+
+    Precedence per row:
+      1. Non-empty ``ticker`` column value → used verbatim. This is how
+         non-ISIN assets (gold, crypto, FX, futures…) enter the system.
+      2. Non-empty ``ISIN`` column value  → looked up in ``isin_to_ticker``.
+      3. Otherwise → ``None`` (caller decides whether to warn or error).
+    """
+    def _resolve(row: pd.Series) -> str | None:
+        direct = str(row.get("ticker", "") or "").strip()
+        if direct:
+            return direct
+        isin = str(row.get("ISIN", "") or "").strip()
+        if isin:
+            return isin_to_ticker.get(isin)
+        return None
+
+    return transactions.apply(_resolve, axis=1)
+
+
 # ---------------------------------------------------------------------------
 # 3. Price retrieval
 # ---------------------------------------------------------------------------
+
+# Suffixes of Yahoo Finance crypto pair symbols. Cryptocurrencies regularly
+# move more than 15 % in a single day (e.g. BTC-USD on 12-Mar-2020 fell ~40 %),
+# so the standard equity-focused spike filter must be loosened — otherwise
+# legitimate price action gets wiped out by interpolation.
+_CRYPTO_SUFFIXES = ("-USD", "-EUR", "-GBP", "-USDT", "-BTC", "-ETH", "-JPY")
+
+
+def _is_crypto_ticker(ticker: str) -> bool:
+    """Heuristic detector for Yahoo Finance cryptocurrency pair symbols."""
+    upper = ticker.upper()
+    return any(upper.endswith(suf) for suf in _CRYPTO_SUFFIXES)
+
 
 def fetch_prices(tickers: list[str], start: str, end: str) -> pd.DataFrame:
     """Download adjusted-close prices for all tickers; returns a wide DataFrame."""
@@ -141,19 +239,29 @@ def fetch_prices(tickers: list[str], start: str, end: str) -> pd.DataFrame:
     prices = prices.ffill()
 
     # ── Spike detection ──────────────────────────────────────────────────────
-    # A single-day move of >20 % for any holding is treated as a data error
+    # A single-day move beyond the threshold is treated as a data error
     # (bad adjusted-close from yfinance after a dividend/split restatement).
     # The bad day is replaced with a linearly interpolated value so that the
     # surrounding series is undisturbed. A warning names the ticker and date.
     #
+    # Equities / ETFs use 15 %. Cryptocurrencies use 50 % because 15 %-20 %
+    # intraday moves are normal in that asset class and would otherwise be
+    # "corrected" into a flat line. Crypto also has no dividends or splits,
+    # so the original motivation for the filter does not really apply.
+    #
     # Two passes: pass 1 removes the spike; pass 2 removes the "echo" return
     # that appears on the day AFTER the spike (which now looks large because
     # the previous day's value changed).
-    SPIKE_THRESHOLD = 0.15
+    SPIKE_THRESHOLD_DEFAULT = 0.15
+    SPIKE_THRESHOLD_CRYPTO = 0.50
     for _ in range(2):
         chg = prices.pct_change().abs()
         for col in prices.columns:
-            bad_days = prices.index[chg[col] > SPIKE_THRESHOLD].tolist()
+            threshold = (
+                SPIKE_THRESHOLD_CRYPTO if _is_crypto_ticker(col)
+                else SPIKE_THRESHOLD_DEFAULT
+            )
+            bad_days = prices.index[chg[col] > threshold].tolist()
             if bad_days:
                 warnings.warn(
                     f"[WARN] {col}: implausible single-day price move on "
@@ -214,14 +322,25 @@ def reconstruct_portfolio(
     .cash_flows attribute: pd.Series of net capital deployed per day (for benchmark use).
     """
     transactions = transactions.copy()
-    transactions["ticker"] = transactions["ISIN"].map(
-        lambda isin: isin_to_ticker.get(isin)
-    )
-    no_ticker = transactions["ticker"].isna()
+    # ``_yf_ticker`` is the resolved Yahoo Finance symbol for each row. We use
+    # an internal name (rather than overwriting a user-provided ``ticker``
+    # column) so rows using direct tickers for non-ISIN assets round-trip
+    # cleanly.
+    transactions["_yf_ticker"] = resolve_tickers(transactions, isin_to_ticker)
+    no_ticker = transactions["_yf_ticker"].isna()
     if no_ticker.any():
-        for isin in transactions.loc[no_ticker, "ISIN"].unique():
-            warnings.warn(f"[WARN] No ticker for ISIN {isin}; skipping.", stacklevel=2)
-    transactions = transactions.dropna(subset=["ticker"])
+        unresolved = sorted({
+            (str(r.get("ticker") or "").strip()
+             or str(r.get("ISIN") or "").strip()
+             or "<empty>")
+            for _, r in transactions[no_ticker].iterrows()
+        })
+        for ident in unresolved:
+            warnings.warn(
+                f"[WARN] No ticker resolved for '{ident}'; skipping.",
+                stacklevel=2,
+            )
+    transactions = transactions.dropna(subset=["_yf_ticker"])
 
     # Snap transaction dates to the next available trading day.
     # Transactions on weekends/holidays are booked at the next market open.
@@ -260,7 +379,7 @@ def reconstruct_portfolio(
         day_invested = 0.0
         if day in tx_by_date:
             for tx in tx_by_date[day]:
-                ticker = tx["ticker"]
+                ticker = tx["_yf_ticker"]
                 shares = float(tx["shares"])
 
                 # Resolve execution price
@@ -475,18 +594,41 @@ def main(argv: list[str] | None = None) -> None:
 
     # --- Load inputs --------------------------------------------------------
     transactions = load_transactions(args.transaction_file)
-    isin_to_ticker = load_lookup(args.lookup_file)
 
-    portfolio_tickers = [
-        isin_to_ticker[isin]
-        for isin in transactions["ISIN"].unique()
-        if isin in isin_to_ticker
-    ]
-    missing_isins = [i for i in transactions["ISIN"].unique() if i not in isin_to_ticker]
-    if missing_isins:
-        sys.exit(f"[ERROR] No ticker mapping for ISIN(s): {missing_isins}. Add them to the lookup file.")
+    # Lookup file is optional: a portfolio that identifies every holding
+    # with a direct ``ticker`` (e.g. crypto-only) does not need one.
+    if args.lookup_file is not None:
+        isin_to_ticker = load_lookup(args.lookup_file)
+    else:
+        isin_to_ticker = {}
+        if (transactions["ISIN"] != "").any():
+            sys.exit(
+                "[ERROR] transactions use ISINs but no lookup file was "
+                "provided. Pass the lookup file as the second positional "
+                "argument, or replace the ISINs with direct 'ticker' values."
+            )
 
-    all_tickers = list(set(portfolio_tickers + [args.benchmark]))
+    # Resolve every transaction to a Yahoo ticker, either via the ISIN
+    # lookup or via the direct ``ticker`` column (used for assets without
+    # an ISIN such as gold, silver and cryptocurrencies).
+    resolved = resolve_tickers(transactions, isin_to_ticker)
+    unresolved_mask = resolved.isna()
+    if unresolved_mask.any():
+        unresolved_ids = sorted({
+            (str(row.get("ticker") or "").strip()
+             or str(row.get("ISIN") or "").strip()
+             or "<empty>")
+            for _, row in transactions[unresolved_mask].iterrows()
+        })
+        sys.exit(
+            f"[ERROR] Could not resolve ticker for: {unresolved_ids}. "
+            "Either add the ISIN to the lookup file, or provide a direct "
+            "Yahoo Finance symbol in the 'ticker' column of the transaction "
+            "file (e.g. BTC-USD for Bitcoin, GC=F for gold futures)."
+        )
+
+    portfolio_tickers = sorted(set(resolved.tolist()))
+    all_tickers = sorted(set(portfolio_tickers + [args.benchmark]))
 
     # --- Date range ---------------------------------------------------------
     start = args.start_date or transactions["date"].min().strftime("%Y-%m-%d")
