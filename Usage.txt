@@ -4,6 +4,8 @@ conda env create -f environment.yml
 # Basic run (buy-and-hold benchmark, default VWCE.DE)
 python portfolio_model.py transaction.csv isin_to_yahoo.csv
 
+claude --resume e3385c99-70a3-422f-b550-de39d313b569 
+
 # Mirror-flows mode with custom benchmark
 python portfolio_model.py transaction.csv isin_to_yahoo.csv --benchmark IWDA.AS --buy_and_hold false
 

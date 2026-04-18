@@ -139,7 +139,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--tax",
         action="store_true",
         default=False,
-        help="Run Austrian KESt (27.5%) tax simulation and print yearly summary",
+        help="Run Austrian KESt (27.5%%) tax simulation and print yearly summary",
     )
     parser.add_argument(
         "--spike-threshold",
