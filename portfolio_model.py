@@ -65,9 +65,63 @@ from typing import Optional
 
 import numpy as np
 import pandas as pd
+import yaml
 import yfinance as yf
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
+
+
+# ---------------------------------------------------------------------------
+# 0. Configuration (config.yml)
+# ---------------------------------------------------------------------------
+
+@dataclass
+class CacheConfig:
+    gap_warn_business_days: int = 5
+
+
+@dataclass
+class DataSourcesConfig:
+    stooq_fallback: bool = True
+
+
+@dataclass
+class AppConfig:
+    cache: CacheConfig = field(default_factory=CacheConfig)
+    data_sources: DataSourcesConfig = field(default_factory=DataSourcesConfig)
+
+
+def _load_config(path: Path | None = None) -> AppConfig:
+    """
+    Load configuration from config.yml next to this module.
+    Missing file → defaults. Malformed file → fail loudly.
+    """
+    cfg_path = path or (Path(__file__).resolve().parent / "config.yml")
+    if not cfg_path.exists():
+        return AppConfig()
+    try:
+        with cfg_path.open("r", encoding="utf-8") as f:
+            data = yaml.safe_load(f) or {}
+    except yaml.YAMLError as e:
+        sys.exit(f"[ERROR] Failed to parse {cfg_path}: {e}")
+    if not isinstance(data, dict):
+        sys.exit(f"[ERROR] {cfg_path}: top-level must be a mapping.")
+    cache_data = data.get("cache") or {}
+    if not isinstance(cache_data, dict):
+        sys.exit(f"[ERROR] {cfg_path}: 'cache' must be a mapping.")
+    ds_data = data.get("data_sources") or {}
+    if not isinstance(ds_data, dict):
+        sys.exit(f"[ERROR] {cfg_path}: 'data_sources' must be a mapping.")
+    return AppConfig(
+        cache=CacheConfig(
+            gap_warn_business_days=int(cache_data.get(
+                "gap_warn_business_days", CacheConfig.gap_warn_business_days)),
+        ),
+        data_sources=DataSourcesConfig(
+            stooq_fallback=bool(ds_data.get(
+                "stooq_fallback", DataSourcesConfig.stooq_fallback)),
+        ),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -171,9 +225,23 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--cache-dir",
         type=Path,
-        default=Path.home() / ".portfolio_cache",
+        default=Path(__file__).resolve().parent / "data",
         dest="cache_dir",
-        help="Directory for local price cache (default: ~/.portfolio_cache/)",
+        help="Directory for local price cache (default: <repo>/data/)",
+    )
+    parser.add_argument(
+        "--no-cache-gap-refetch",
+        action="store_true",
+        default=False,
+        dest="no_cache_gap_refetch",
+        help="Detect and warn on interior cache gaps but do not refetch them",
+    )
+    parser.add_argument(
+        "--no-stooq-fallback",
+        action="store_true",
+        default=False,
+        dest="no_stooq_fallback",
+        help="Disable the Stooq fallback used when yfinance returns gappy or stale data",
     )
     return parser.parse_args(argv)
 
@@ -539,6 +607,83 @@ def _save_cache(cache_dir: Path, ticker: str, df: pd.DataFrame) -> None:
     df.to_csv(p, index_label="date")
 
 
+def _detect_cache_gaps(
+    series: pd.Series,
+    threshold_bdays: int,
+) -> list[tuple[pd.Timestamp, pd.Timestamp]]:
+    """
+    Find interior gaps in a daily-ish price series.
+
+    A gap is a span of consecutive *missing* business days strictly
+    between two existing rows. yfinance never returns weekends or
+    exchange holidays, so the threshold is in business days to avoid
+    false positives over normal weekends/holiday weeks.
+
+    Returns a list of (gap_start, gap_end) inclusive ranges, where
+    gap_start = (prev_row + 1 calendar day) and gap_end = (next_row -
+    1 calendar day). Empty list when the series has no gaps exceeding
+    the threshold.
+    """
+    if series is None or series.empty or threshold_bdays < 0:
+        return []
+    idx = series.dropna().index.sort_values()
+    if len(idx) < 2:
+        return []
+    gaps: list[tuple[pd.Timestamp, pd.Timestamp]] = []
+    one_day = pd.Timedelta(days=1)
+    for prev, curr in zip(idx[:-1], idx[1:]):
+        gap_start = prev + one_day
+        gap_end = curr - one_day
+        if gap_start > gap_end:
+            continue
+        n_bdays = len(pd.bdate_range(gap_start, gap_end))
+        if n_bdays > threshold_bdays:
+            gaps.append((gap_start, gap_end))
+    return gaps
+
+
+def _detect_stale_runs(
+    series: pd.Series,
+    threshold_bdays: int,
+) -> list[tuple[pd.Timestamp, pd.Timestamp, float]]:
+    """
+    Find runs of consecutive identical values in a daily-ish price series.
+
+    Detects the failure mode where yfinance returns a daily row for
+    every business day but the value is the same number repeated for
+    weeks/months/years (illiquid or halted instruments). This passes
+    the index-gap check undetected.
+
+    Returns (run_start, run_end, value) for runs whose business-day
+    span strictly exceeds threshold_bdays.
+    """
+    if series is None or series.empty or threshold_bdays < 0:
+        return []
+    s = series.dropna().sort_index()
+    if len(s) < 2:
+        return []
+
+    runs: list[tuple[pd.Timestamp, pd.Timestamp, float]] = []
+    run_start_pos = 0
+    for i in range(1, len(s)):
+        if s.iloc[i] != s.iloc[i - 1]:
+            if i - 1 > run_start_pos:
+                start_ts = s.index[run_start_pos]
+                end_ts = s.index[i - 1]
+                n_bdays = len(pd.bdate_range(start_ts, end_ts))
+                if n_bdays > threshold_bdays:
+                    runs.append((start_ts, end_ts, float(s.iloc[run_start_pos])))
+            run_start_pos = i
+    # Trailing run
+    if len(s) - 1 > run_start_pos:
+        start_ts = s.index[run_start_pos]
+        end_ts = s.index[-1]
+        n_bdays = len(pd.bdate_range(start_ts, end_ts))
+        if n_bdays > threshold_bdays:
+            runs.append((start_ts, end_ts, float(s.iloc[run_start_pos])))
+    return runs
+
+
 def _download_prices_raw(
     tickers: list[str],
     start: str,
@@ -570,6 +715,94 @@ def _download_prices_raw(
     return prices
 
 
+# ── Stooq fallback ─────────────────────────────────────────────────────────
+# Stooq (https://stooq.com) serves daily OHLCV CSV without auth or rate
+# limits and often has cleaner data for European ETCs/ETFs than Yahoo.
+# Used as a fallback when yfinance returns gappy or stale data.
+
+# Yahoo exchange suffix → Stooq exchange suffix.
+# Stooq omits the suffix for US tickers (or accepts ".us"); for others
+# it uses ISO-style country codes. List is conservative — extend as
+# needed when new exchanges show up.
+_YAHOO_TO_STOOQ_SUFFIX: dict[str, str] = {
+    "AS": "nl",   # Euronext Amsterdam
+    "DE": "de",   # Xetra
+    "F":  "de",   # Frankfurt
+    "L":  "uk",   # London
+    "PA": "fr",   # Euronext Paris
+    "MI": "it",   # Borsa Italiana
+    "SW": "ch",   # SIX Swiss
+    "MC": "es",   # Madrid
+    "VI": "at",   # Vienna
+    "OL": "no",   # Oslo
+    "ST": "se",   # Stockholm
+    "CO": "dk",   # Copenhagen
+    "HE": "fi",   # Helsinki
+    "BR": "be",   # Brussels
+    "LS": "pt",   # Lisbon
+    "IR": "ie",   # Ireland
+    "WA": "pl",   # Warsaw
+    "PR": "cz",   # Prague
+    "BD": "hu",   # Budapest
+}
+
+
+def _yahoo_to_stooq(yahoo_symbol: str) -> str | None:
+    """
+    Translate a Yahoo Finance symbol to its Stooq equivalent.
+    Returns None when no mapping is known (caller should skip).
+    Examples:
+        PHPD.AS  → phpd.nl
+        VWCE.DE  → vwce.de
+        AAPL     → aapl.us
+        BTC-USD  → None (crypto / non-equity, not handled)
+    """
+    if not yahoo_symbol or "-" in yahoo_symbol or "=" in yahoo_symbol:
+        return None
+    if "." not in yahoo_symbol:
+        # Assume US listing
+        return f"{yahoo_symbol.lower()}.us"
+    base, _, suffix = yahoo_symbol.rpartition(".")
+    stooq_suffix = _YAHOO_TO_STOOQ_SUFFIX.get(suffix.upper())
+    if stooq_suffix is None:
+        return None
+    return f"{base.lower()}.{stooq_suffix}"
+
+
+def _download_stooq(
+    yahoo_symbol: str,
+    start: str,
+    end: str,
+) -> pd.Series:
+    """
+    Fetch daily Close prices for `yahoo_symbol` from Stooq for
+    [start, end] (both inclusive in Stooq's API). Returns an empty
+    Series on any failure (unknown symbol, network error, no data).
+    """
+    stooq_sym = _yahoo_to_stooq(yahoo_symbol)
+    if stooq_sym is None:
+        return pd.Series(dtype="float64")
+    d1 = pd.Timestamp(start).strftime("%Y%m%d")
+    # Stooq's d2 is inclusive; yfinance end is exclusive. Subtract 1
+    # day so the request covers the same set of trading days as the
+    # equivalent yfinance call.
+    d2 = (pd.Timestamp(end) - pd.Timedelta(days=1)).strftime("%Y%m%d")
+    url = f"https://stooq.com/q/d/l/?s={stooq_sym}&d1={d1}&d2={d2}&i=d"
+    try:
+        df = pd.read_csv(url)
+    except Exception:
+        return pd.Series(dtype="float64")
+    if df.empty or "Date" not in df.columns or "Close" not in df.columns:
+        return pd.Series(dtype="float64")
+    df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
+    df = df.dropna(subset=["Date"]).set_index("Date").sort_index()
+    if df.empty:
+        return pd.Series(dtype="float64")
+    s = df["Close"].astype("float64").dropna()
+    s.name = yahoo_symbol
+    return s
+
+
 def fetch_prices(
     tickers: list[str],
     start: str,
@@ -578,6 +811,9 @@ def fetch_prices(
     no_cache: bool = False,
     verbose: bool = False,
     spike_threshold: float = 0.15,
+    gap_warn_bdays: int = 5,
+    refetch_gaps: bool = True,
+    use_stooq_fallback: bool = True,
 ) -> pd.DataFrame:
     """
     Download (or load from cache) adjusted-close prices for all tickers.
@@ -594,39 +830,59 @@ def fetch_prices(
 
     # ── Per-ticker cache logic ───────────────────────────────────────────────
     all_frames: dict[str, pd.Series] = {}
-    need_download: dict[str, tuple[str, str]] = {}  # ticker → (dl_start, dl_end)
+    # ticker → list of (dl_start, dl_end) ranges to fetch (dl_end exclusive,
+    # matching yfinance semantics).
+    need_download: dict[str, list[tuple[str, str]]] = {}
 
     for ticker in tickers:
         if cache_dir is not None and not no_cache:
             cached = _load_cache(cache_dir, ticker)
             if cached is not None and not cached.empty and "close" in cached.columns:
+                cached_series = cached["close"]
                 last_cached = cached.index.max()
                 target_end = pd.Timestamp(end)
-                if last_cached >= target_end - pd.Timedelta(days=2):
-                    # Cache is up to date
-                    s = cached["close"].loc[start:]
-                    all_frames[ticker] = s
-                    if verbose:
-                        print(f"[VERBOSE] Cache hit for {ticker}: {len(s)} rows "
-                              f"(last={last_cached.date()})")
-                    continue
-                else:
-                    # Partial cache — download the missing tail
-                    dl_start = (last_cached + pd.Timedelta(days=1)).strftime("%Y-%m-%d")
-                    need_download[ticker] = (dl_start, end)
-                    all_frames[ticker] = cached["close"]
-                    if verbose:
-                        print(f"[VERBOSE] Partial cache for {ticker}; "
-                              f"downloading from {dl_start}")
-                    continue
-        need_download[ticker] = (start, end)
+                ranges_for_ticker: list[tuple[str, str]] = []
 
-    # Batch download needed tickers grouped by (start, end)
+                # Tail refetch when the cache hasn't been updated to the
+                # requested end date.
+                if last_cached < target_end - pd.Timedelta(days=2):
+                    dl_start = (last_cached + pd.Timedelta(days=1)).strftime("%Y-%m-%d")
+                    ranges_for_ticker.append((dl_start, end))
+
+                # Interior-gap refetch: any span of consecutive missing
+                # business days inside the cache that exceeds the threshold.
+                if refetch_gaps:
+                    gaps = _detect_cache_gaps(cached_series, gap_warn_bdays)
+                    for gap_s, gap_e in gaps:
+                        n_bd = len(pd.bdate_range(gap_s, gap_e))
+                        print(f"[INFO] {ticker}: detected interior cache gap "
+                              f"{gap_s.date()} → {gap_e.date()} ({n_bd} business "
+                              f"days); scheduling refetch.")
+                        ranges_for_ticker.append((
+                            gap_s.strftime("%Y-%m-%d"),
+                            (gap_e + pd.Timedelta(days=1)).strftime("%Y-%m-%d"),
+                        ))
+
+                all_frames[ticker] = cached_series
+                if ranges_for_ticker:
+                    need_download[ticker] = ranges_for_ticker
+                    if verbose:
+                        print(f"[VERBOSE] {ticker}: {len(ranges_for_ticker)} "
+                              f"refetch range(s) scheduled")
+                else:
+                    if verbose:
+                        print(f"[VERBOSE] Cache hit for {ticker}: "
+                              f"{len(cached_series)} rows (last={last_cached.date()})")
+                continue
+        need_download[ticker] = [(start, end)]
+
+    # Batch download needed tickers grouped by (start, end) so multiple
+    # tickers sharing a range hit yfinance in a single call.
     if need_download:
-        # Group tickers with the same date range for efficiency
         ranges: dict[tuple[str, str], list[str]] = {}
-        for ticker, (dl_s, dl_e) in need_download.items():
-            ranges.setdefault((dl_s, dl_e), []).append(ticker)
+        for ticker, dl_ranges in need_download.items():
+            for (dl_s, dl_e) in dl_ranges:
+                ranges.setdefault((dl_s, dl_e), []).append(ticker)
 
         for (dl_s, dl_e), batch in ranges.items():
             print(f"[INFO] Downloading prices for {len(batch)} ticker(s) "
@@ -642,30 +898,125 @@ def fetch_prices(
                     continue
                 new_series = raw_prices[ticker].dropna()
 
-                if cache_dir is not None and not no_cache:
-                    existing = all_frames.get(ticker)
-                    if existing is not None and not existing.empty:
-                        combined = pd.concat([existing, new_series])
-                        combined = combined[~combined.index.duplicated(keep="last")]
-                        combined = combined.sort_index()
-                        all_frames[ticker] = combined
-                        _save_cache(cache_dir, ticker,
-                                    pd.DataFrame({"close": combined}))
-                    else:
-                        all_frames[ticker] = new_series
-                        _save_cache(cache_dir, ticker,
-                                    pd.DataFrame({"close": new_series}))
+                existing = all_frames.get(ticker)
+                if existing is not None and not existing.empty:
+                    combined = pd.concat([existing, new_series])
+                    combined = combined[~combined.index.duplicated(keep="last")]
+                    combined = combined.sort_index()
+                    all_frames[ticker] = combined
                 else:
-                    existing = all_frames.get(ticker)
-                    if existing is not None and not existing.empty:
-                        combined = pd.concat([existing, new_series])
-                        combined = combined[~combined.index.duplicated(keep="last")]
-                        all_frames[ticker] = combined.sort_index()
-                    else:
-                        all_frames[ticker] = new_series
+                    all_frames[ticker] = new_series
+
+                if cache_dir is not None and not no_cache:
+                    _save_cache(cache_dir, ticker,
+                                pd.DataFrame({"close": all_frames[ticker]}))
 
     if not all_frames:
         sys.exit("[ERROR] No price data available after cache/download.")
+
+    # ── Stooq fallback ──────────────────────────────────────────────────────
+    # For each ticker, if yfinance left index gaps or stale-value runs in
+    # the analysis window, ask Stooq for the affected range and splice in
+    # the result if it's healthier (no gaps and no stale runs of its own).
+    # The cache is updated so subsequent runs benefit from the repair.
+    if use_stooq_fallback:
+        for ticker in list(all_frames.keys()):
+            series = all_frames[ticker].loc[start:end]
+            bad_ranges: list[tuple[pd.Timestamp, pd.Timestamp]] = []
+            bad_ranges.extend(_detect_cache_gaps(series, gap_warn_bdays))
+            for run_s, run_e, _val in _detect_stale_runs(series, gap_warn_bdays):
+                bad_ranges.append((run_s, run_e))
+            if not bad_ranges:
+                continue
+
+            stooq_sym = _yahoo_to_stooq(ticker)
+            if stooq_sym is None:
+                if verbose:
+                    print(f"[VERBOSE] Stooq fallback: no symbol mapping for "
+                          f"{ticker}; skipping.")
+                continue
+
+            spliced_any = False
+            for r_start, r_end in bad_ranges:
+                # Pad each range by a few days on either side so Stooq
+                # data overlaps neighbouring known-good rows.
+                pad = pd.Timedelta(days=7)
+                fetch_start = (r_start - pad).strftime("%Y-%m-%d")
+                fetch_end = (r_end + pad + pd.Timedelta(days=1)).strftime("%Y-%m-%d")
+                print(f"[INFO] {ticker}: yfinance data unhealthy for "
+                      f"{r_start.date()} → {r_end.date()}; trying Stooq "
+                      f"({stooq_sym}) …")
+                stooq_series = _download_stooq(ticker, fetch_start, fetch_end)
+                if stooq_series.empty:
+                    print(f"[INFO] {ticker}: Stooq returned no data for this range.")
+                    continue
+
+                # Restrict to the bad range itself so we don't overwrite
+                # known-good neighbours with potentially-different Stooq values.
+                window = stooq_series.loc[r_start:r_end]
+                if window.empty:
+                    continue
+
+                # Verify Stooq's data is actually healthier than what we have.
+                if (_detect_cache_gaps(window, gap_warn_bdays)
+                        or _detect_stale_runs(window, gap_warn_bdays)):
+                    print(f"[INFO] {ticker}: Stooq data also has gaps or "
+                          f"stale runs in this range; not splicing.")
+                    continue
+
+                existing = all_frames[ticker]
+                combined = pd.concat([existing, window])
+                combined = combined[~combined.index.duplicated(keep="last")]
+                combined = combined.sort_index()
+                all_frames[ticker] = combined
+                spliced_any = True
+                print(f"[INFO] {ticker}: spliced {len(window)} row(s) from "
+                      f"Stooq covering {window.index.min().date()} → "
+                      f"{window.index.max().date()}.")
+
+            if spliced_any and cache_dir is not None and not no_cache:
+                _save_cache(cache_dir, ticker,
+                            pd.DataFrame({"close": all_frames[ticker]}))
+
+    # ── Residual-gap and stale-run warnings ─────────────────────────────────
+    # Two failure modes are checked here, both restricted to the analysis
+    # window so noise outside [start, end] doesn't surface:
+    #
+    #  1. *Index gaps*: missing business-day rows between two cached rows.
+    #     If they remain after refetch, yfinance has no data for the range.
+    #
+    #  2. *Stale-value runs*: rows present for every business day but the
+    #     value is the same number repeated. yfinance does this for halted
+    #     or illiquid instruments. The index-gap check cannot see this; the
+    #     value-based check catches it. No remediation is possible (refetch
+    #     returns the same stale data) — just warn so the user knows the
+    #     TWR is being computed across artificial flat data.
+    for ticker, series in all_frames.items():
+        windowed = series.loc[start:end]
+
+        residual_gaps = _detect_cache_gaps(windowed, gap_warn_bdays)
+        for gap_s, gap_e in residual_gaps:
+            n_bd = len(pd.bdate_range(gap_s, gap_e))
+            warnings.warn(
+                f"[WARN] {ticker}: residual price gap {gap_s.date()} → "
+                f"{gap_e.date()} ({n_bd} business days) after refetch. "
+                f"Forward-fill will hold the last known price across this "
+                f"range; portfolio value and TWR will appear flat here.",
+                stacklevel=2,
+            )
+
+        stale_runs = _detect_stale_runs(windowed, gap_warn_bdays)
+        for run_s, run_e, val in stale_runs:
+            n_bd = len(pd.bdate_range(run_s, run_e))
+            warnings.warn(
+                f"[WARN] {ticker}: stale price run {run_s.date()} → "
+                f"{run_e.date()} ({n_bd} business days at {val:.4f}). "
+                f"yfinance returned the same value for every day in this "
+                f"range (likely halted/illiquid instrument). Portfolio "
+                f"value and TWR will appear flat here; treat reported "
+                f"performance over this range as unreliable.",
+                stacklevel=2,
+            )
 
     # Build wide DataFrame from start to end
     prices = pd.DataFrame(all_frames)
@@ -738,6 +1089,9 @@ def fetch_fx_rates(
     no_cache: bool = False,
     verbose: bool = False,
     spike_threshold: float = 0.15,
+    gap_warn_bdays: int = 5,
+    refetch_gaps: bool = True,
+    use_stooq_fallback: bool = True,
 ) -> pd.DataFrame:
     """
     Download daily EUR/foreign FX rates for any non-EUR currencies.
@@ -765,6 +1119,9 @@ def fetch_fx_rates(
         no_cache=no_cache,
         verbose=verbose,
         spike_threshold=spike_threshold,
+        gap_warn_bdays=gap_warn_bdays,
+        refetch_gaps=refetch_gaps,
+        use_stooq_fallback=use_stooq_fallback,
     )
 
     # Rename columns from EURUSD=X → USD
@@ -1765,6 +2122,12 @@ def plot_performance(
 
 def main(argv: list[str] | None = None) -> None:
     args = parse_args(argv)
+    app_config = _load_config()
+    gap_warn_bdays = app_config.cache.gap_warn_business_days
+    refetch_gaps = not args.no_cache_gap_refetch
+    use_stooq_fallback = (
+        app_config.data_sources.stooq_fallback and not args.no_stooq_fallback
+    )
 
     # ── Clear cache and exit if requested ───────────────────────────────────
     if args.clear_cache:
@@ -1843,6 +2206,9 @@ def main(argv: list[str] | None = None) -> None:
             no_cache=args.no_cache,
             verbose=args.verbose,
             spike_threshold=args.spike_threshold,
+            gap_warn_bdays=gap_warn_bdays,
+            refetch_gaps=refetch_gaps,
+            use_stooq_fallback=use_stooq_fallback,
         )
         if args.verbose and not fx_rates.empty:
             print(f"[VERBOSE] FX rates tail:\n{fx_rates.tail(5)}")
@@ -1858,6 +2224,9 @@ def main(argv: list[str] | None = None) -> None:
         no_cache=args.no_cache,
         verbose=args.verbose,
         spike_threshold=args.spike_threshold,
+        gap_warn_bdays=gap_warn_bdays,
+        refetch_gaps=refetch_gaps,
+        use_stooq_fallback=use_stooq_fallback,
     )
 
     if args.benchmark not in prices.columns:
