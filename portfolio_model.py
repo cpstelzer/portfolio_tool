@@ -622,6 +622,48 @@ def _detect_cache_gaps(
     return gaps
 
 
+def _detect_stale_runs(
+    series: pd.Series,
+    threshold_bdays: int,
+) -> list[tuple[pd.Timestamp, pd.Timestamp, float]]:
+    """
+    Find runs of consecutive identical values in a daily-ish price series.
+
+    Detects the failure mode where yfinance returns a daily row for
+    every business day but the value is the same number repeated for
+    weeks/months/years (illiquid or halted instruments). This passes
+    the index-gap check undetected.
+
+    Returns (run_start, run_end, value) for runs whose business-day
+    span strictly exceeds threshold_bdays.
+    """
+    if series is None or series.empty or threshold_bdays < 0:
+        return []
+    s = series.dropna().sort_index()
+    if len(s) < 2:
+        return []
+
+    runs: list[tuple[pd.Timestamp, pd.Timestamp, float]] = []
+    run_start_pos = 0
+    for i in range(1, len(s)):
+        if s.iloc[i] != s.iloc[i - 1]:
+            if i - 1 > run_start_pos:
+                start_ts = s.index[run_start_pos]
+                end_ts = s.index[i - 1]
+                n_bdays = len(pd.bdate_range(start_ts, end_ts))
+                if n_bdays > threshold_bdays:
+                    runs.append((start_ts, end_ts, float(s.iloc[run_start_pos])))
+            run_start_pos = i
+    # Trailing run
+    if len(s) - 1 > run_start_pos:
+        start_ts = s.index[run_start_pos]
+        end_ts = s.index[-1]
+        n_bdays = len(pd.bdate_range(start_ts, end_ts))
+        if n_bdays > threshold_bdays:
+            runs.append((start_ts, end_ts, float(s.iloc[run_start_pos])))
+    return runs
+
+
 def _download_prices_raw(
     tickers: list[str],
     start: str,
@@ -763,14 +805,22 @@ def fetch_prices(
     if not all_frames:
         sys.exit("[ERROR] No price data available after cache/download.")
 
-    # ── Residual-gap warning ────────────────────────────────────────────────
-    # After cache+refetch, any interior gap larger than the threshold means
-    # yfinance has no data for that range. The unconditional ffill below will
-    # mask it; warn so the user knows the TWR is being held flat there.
-    # Restrict the check to the analysis window so gaps outside [start, end]
-    # don't produce noise.
+    # ── Residual-gap and stale-run warnings ─────────────────────────────────
+    # Two failure modes are checked here, both restricted to the analysis
+    # window so noise outside [start, end] doesn't surface:
+    #
+    #  1. *Index gaps*: missing business-day rows between two cached rows.
+    #     If they remain after refetch, yfinance has no data for the range.
+    #
+    #  2. *Stale-value runs*: rows present for every business day but the
+    #     value is the same number repeated. yfinance does this for halted
+    #     or illiquid instruments. The index-gap check cannot see this; the
+    #     value-based check catches it. No remediation is possible (refetch
+    #     returns the same stale data) — just warn so the user knows the
+    #     TWR is being computed across artificial flat data.
     for ticker, series in all_frames.items():
         windowed = series.loc[start:end]
+
         residual_gaps = _detect_cache_gaps(windowed, gap_warn_bdays)
         for gap_s, gap_e in residual_gaps:
             n_bd = len(pd.bdate_range(gap_s, gap_e))
@@ -779,6 +829,19 @@ def fetch_prices(
                 f"{gap_e.date()} ({n_bd} business days) after refetch. "
                 f"Forward-fill will hold the last known price across this "
                 f"range; portfolio value and TWR will appear flat here.",
+                stacklevel=2,
+            )
+
+        stale_runs = _detect_stale_runs(windowed, gap_warn_bdays)
+        for run_s, run_e, val in stale_runs:
+            n_bd = len(pd.bdate_range(run_s, run_e))
+            warnings.warn(
+                f"[WARN] {ticker}: stale price run {run_s.date()} → "
+                f"{run_e.date()} ({n_bd} business days at {val:.4f}). "
+                f"yfinance returned the same value for every day in this "
+                f"range (likely halted/illiquid instrument). Portfolio "
+                f"value and TWR will appear flat here; treat reported "
+                f"performance over this range as unreliable.",
                 stacklevel=2,
             )
 
