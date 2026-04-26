@@ -699,7 +699,12 @@ def _download_prices_raw(
         threads=True,
     )
     if raw.empty:
-        sys.exit("[ERROR] yfinance returned no data. Check tickers and date range.")
+        warnings.warn(
+            f"[WARN] yfinance returned no data for tickers {tickers} "
+            f"({start} → {end}). They may be delisted or the range is outside their trading history.",
+            stacklevel=2,
+        )
+        return pd.DataFrame()
 
     if isinstance(raw.columns, pd.MultiIndex):
         prices = raw["Close"]
