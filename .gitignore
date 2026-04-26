@@ -11,3 +11,6 @@ env/
 # Editors
 .idea/
 *.swp
+
+# Local price cache
+data/

@@ -1,0 +1,23 @@
+# Configuration for portfolio_model.py
+#
+# This file is loaded once at startup. Missing keys fall back to the
+# built-in defaults shown below. A missing file is silently tolerated;
+# a malformed file fails loudly.
+
+cache:
+  # Interior price-cache gaps strictly larger than this many *business
+  # days* between two consecutive cached rows trigger:
+  #   1. a refetch of the missing range from yfinance, and
+  #   2. a warning if the gap still remains after refetch.
+  # Set high enough to tolerate normal exchange holiday weeks (Christmas,
+  # Easter, etc.) and low enough to catch real data dropouts.
+  gap_warn_business_days: 5
+
+data_sources:
+  # When yfinance returns suspicious data for a ticker (interior gap or
+  # stale-value run exceeding cache.gap_warn_business_days), retry the
+  # affected range against Stooq (https://stooq.com) and splice the
+  # result in if Stooq's data is healthier. Stooq is free, no API key
+  # required, and often has cleaner data for European ETCs/ETFs where
+  # Yahoo struggles. Disable per run with --no-stooq-fallback.
+  stooq_fallback: true
