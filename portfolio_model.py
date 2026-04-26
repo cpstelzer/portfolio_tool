@@ -81,8 +81,14 @@ class CacheConfig:
 
 
 @dataclass
+class DataSourcesConfig:
+    stooq_fallback: bool = True
+
+
+@dataclass
 class AppConfig:
     cache: CacheConfig = field(default_factory=CacheConfig)
+    data_sources: DataSourcesConfig = field(default_factory=DataSourcesConfig)
 
 
 def _load_config(path: Path | None = None) -> AppConfig:
@@ -103,10 +109,17 @@ def _load_config(path: Path | None = None) -> AppConfig:
     cache_data = data.get("cache") or {}
     if not isinstance(cache_data, dict):
         sys.exit(f"[ERROR] {cfg_path}: 'cache' must be a mapping.")
+    ds_data = data.get("data_sources") or {}
+    if not isinstance(ds_data, dict):
+        sys.exit(f"[ERROR] {cfg_path}: 'data_sources' must be a mapping.")
     return AppConfig(
         cache=CacheConfig(
             gap_warn_business_days=int(cache_data.get(
                 "gap_warn_business_days", CacheConfig.gap_warn_business_days)),
+        ),
+        data_sources=DataSourcesConfig(
+            stooq_fallback=bool(ds_data.get(
+                "stooq_fallback", DataSourcesConfig.stooq_fallback)),
         ),
     )
 
@@ -222,6 +235,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=False,
         dest="no_cache_gap_refetch",
         help="Detect and warn on interior cache gaps but do not refetch them",
+    )
+    parser.add_argument(
+        "--no-stooq-fallback",
+        action="store_true",
+        default=False,
+        dest="no_stooq_fallback",
+        help="Disable the Stooq fallback used when yfinance returns gappy or stale data",
     )
     return parser.parse_args(argv)
 
@@ -695,6 +715,94 @@ def _download_prices_raw(
     return prices
 
 
+# ── Stooq fallback ─────────────────────────────────────────────────────────
+# Stooq (https://stooq.com) serves daily OHLCV CSV without auth or rate
+# limits and often has cleaner data for European ETCs/ETFs than Yahoo.
+# Used as a fallback when yfinance returns gappy or stale data.
+
+# Yahoo exchange suffix → Stooq exchange suffix.
+# Stooq omits the suffix for US tickers (or accepts ".us"); for others
+# it uses ISO-style country codes. List is conservative — extend as
+# needed when new exchanges show up.
+_YAHOO_TO_STOOQ_SUFFIX: dict[str, str] = {
+    "AS": "nl",   # Euronext Amsterdam
+    "DE": "de",   # Xetra
+    "F":  "de",   # Frankfurt
+    "L":  "uk",   # London
+    "PA": "fr",   # Euronext Paris
+    "MI": "it",   # Borsa Italiana
+    "SW": "ch",   # SIX Swiss
+    "MC": "es",   # Madrid
+    "VI": "at",   # Vienna
+    "OL": "no",   # Oslo
+    "ST": "se",   # Stockholm
+    "CO": "dk",   # Copenhagen
+    "HE": "fi",   # Helsinki
+    "BR": "be",   # Brussels
+    "LS": "pt",   # Lisbon
+    "IR": "ie",   # Ireland
+    "WA": "pl",   # Warsaw
+    "PR": "cz",   # Prague
+    "BD": "hu",   # Budapest
+}
+
+
+def _yahoo_to_stooq(yahoo_symbol: str) -> str | None:
+    """
+    Translate a Yahoo Finance symbol to its Stooq equivalent.
+    Returns None when no mapping is known (caller should skip).
+    Examples:
+        PHPD.AS  → phpd.nl
+        VWCE.DE  → vwce.de
+        AAPL     → aapl.us
+        BTC-USD  → None (crypto / non-equity, not handled)
+    """
+    if not yahoo_symbol or "-" in yahoo_symbol or "=" in yahoo_symbol:
+        return None
+    if "." not in yahoo_symbol:
+        # Assume US listing
+        return f"{yahoo_symbol.lower()}.us"
+    base, _, suffix = yahoo_symbol.rpartition(".")
+    stooq_suffix = _YAHOO_TO_STOOQ_SUFFIX.get(suffix.upper())
+    if stooq_suffix is None:
+        return None
+    return f"{base.lower()}.{stooq_suffix}"
+
+
+def _download_stooq(
+    yahoo_symbol: str,
+    start: str,
+    end: str,
+) -> pd.Series:
+    """
+    Fetch daily Close prices for `yahoo_symbol` from Stooq for
+    [start, end] (both inclusive in Stooq's API). Returns an empty
+    Series on any failure (unknown symbol, network error, no data).
+    """
+    stooq_sym = _yahoo_to_stooq(yahoo_symbol)
+    if stooq_sym is None:
+        return pd.Series(dtype="float64")
+    d1 = pd.Timestamp(start).strftime("%Y%m%d")
+    # Stooq's d2 is inclusive; yfinance end is exclusive. Subtract 1
+    # day so the request covers the same set of trading days as the
+    # equivalent yfinance call.
+    d2 = (pd.Timestamp(end) - pd.Timedelta(days=1)).strftime("%Y%m%d")
+    url = f"https://stooq.com/q/d/l/?s={stooq_sym}&d1={d1}&d2={d2}&i=d"
+    try:
+        df = pd.read_csv(url)
+    except Exception:
+        return pd.Series(dtype="float64")
+    if df.empty or "Date" not in df.columns or "Close" not in df.columns:
+        return pd.Series(dtype="float64")
+    df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
+    df = df.dropna(subset=["Date"]).set_index("Date").sort_index()
+    if df.empty:
+        return pd.Series(dtype="float64")
+    s = df["Close"].astype("float64").dropna()
+    s.name = yahoo_symbol
+    return s
+
+
 def fetch_prices(
     tickers: list[str],
     start: str,
@@ -705,6 +813,7 @@ def fetch_prices(
     spike_threshold: float = 0.15,
     gap_warn_bdays: int = 5,
     refetch_gaps: bool = True,
+    use_stooq_fallback: bool = True,
 ) -> pd.DataFrame:
     """
     Download (or load from cache) adjusted-close prices for all tickers.
@@ -804,6 +913,70 @@ def fetch_prices(
 
     if not all_frames:
         sys.exit("[ERROR] No price data available after cache/download.")
+
+    # ── Stooq fallback ──────────────────────────────────────────────────────
+    # For each ticker, if yfinance left index gaps or stale-value runs in
+    # the analysis window, ask Stooq for the affected range and splice in
+    # the result if it's healthier (no gaps and no stale runs of its own).
+    # The cache is updated so subsequent runs benefit from the repair.
+    if use_stooq_fallback:
+        for ticker in list(all_frames.keys()):
+            series = all_frames[ticker].loc[start:end]
+            bad_ranges: list[tuple[pd.Timestamp, pd.Timestamp]] = []
+            bad_ranges.extend(_detect_cache_gaps(series, gap_warn_bdays))
+            for run_s, run_e, _val in _detect_stale_runs(series, gap_warn_bdays):
+                bad_ranges.append((run_s, run_e))
+            if not bad_ranges:
+                continue
+
+            stooq_sym = _yahoo_to_stooq(ticker)
+            if stooq_sym is None:
+                if verbose:
+                    print(f"[VERBOSE] Stooq fallback: no symbol mapping for "
+                          f"{ticker}; skipping.")
+                continue
+
+            spliced_any = False
+            for r_start, r_end in bad_ranges:
+                # Pad each range by a few days on either side so Stooq
+                # data overlaps neighbouring known-good rows.
+                pad = pd.Timedelta(days=7)
+                fetch_start = (r_start - pad).strftime("%Y-%m-%d")
+                fetch_end = (r_end + pad + pd.Timedelta(days=1)).strftime("%Y-%m-%d")
+                print(f"[INFO] {ticker}: yfinance data unhealthy for "
+                      f"{r_start.date()} → {r_end.date()}; trying Stooq "
+                      f"({stooq_sym}) …")
+                stooq_series = _download_stooq(ticker, fetch_start, fetch_end)
+                if stooq_series.empty:
+                    print(f"[INFO] {ticker}: Stooq returned no data for this range.")
+                    continue
+
+                # Restrict to the bad range itself so we don't overwrite
+                # known-good neighbours with potentially-different Stooq values.
+                window = stooq_series.loc[r_start:r_end]
+                if window.empty:
+                    continue
+
+                # Verify Stooq's data is actually healthier than what we have.
+                if (_detect_cache_gaps(window, gap_warn_bdays)
+                        or _detect_stale_runs(window, gap_warn_bdays)):
+                    print(f"[INFO] {ticker}: Stooq data also has gaps or "
+                          f"stale runs in this range; not splicing.")
+                    continue
+
+                existing = all_frames[ticker]
+                combined = pd.concat([existing, window])
+                combined = combined[~combined.index.duplicated(keep="last")]
+                combined = combined.sort_index()
+                all_frames[ticker] = combined
+                spliced_any = True
+                print(f"[INFO] {ticker}: spliced {len(window)} row(s) from "
+                      f"Stooq covering {window.index.min().date()} → "
+                      f"{window.index.max().date()}.")
+
+            if spliced_any and cache_dir is not None and not no_cache:
+                _save_cache(cache_dir, ticker,
+                            pd.DataFrame({"close": all_frames[ticker]}))
 
     # ── Residual-gap and stale-run warnings ─────────────────────────────────
     # Two failure modes are checked here, both restricted to the analysis
@@ -918,6 +1091,7 @@ def fetch_fx_rates(
     spike_threshold: float = 0.15,
     gap_warn_bdays: int = 5,
     refetch_gaps: bool = True,
+    use_stooq_fallback: bool = True,
 ) -> pd.DataFrame:
     """
     Download daily EUR/foreign FX rates for any non-EUR currencies.
@@ -947,6 +1121,7 @@ def fetch_fx_rates(
         spike_threshold=spike_threshold,
         gap_warn_bdays=gap_warn_bdays,
         refetch_gaps=refetch_gaps,
+        use_stooq_fallback=use_stooq_fallback,
     )
 
     # Rename columns from EURUSD=X → USD
@@ -1950,6 +2125,9 @@ def main(argv: list[str] | None = None) -> None:
     app_config = _load_config()
     gap_warn_bdays = app_config.cache.gap_warn_business_days
     refetch_gaps = not args.no_cache_gap_refetch
+    use_stooq_fallback = (
+        app_config.data_sources.stooq_fallback and not args.no_stooq_fallback
+    )
 
     # ── Clear cache and exit if requested ───────────────────────────────────
     if args.clear_cache:
@@ -2030,6 +2208,7 @@ def main(argv: list[str] | None = None) -> None:
             spike_threshold=args.spike_threshold,
             gap_warn_bdays=gap_warn_bdays,
             refetch_gaps=refetch_gaps,
+            use_stooq_fallback=use_stooq_fallback,
         )
         if args.verbose and not fx_rates.empty:
             print(f"[VERBOSE] FX rates tail:\n{fx_rates.tail(5)}")
@@ -2047,6 +2226,7 @@ def main(argv: list[str] | None = None) -> None:
         spike_threshold=args.spike_threshold,
         gap_warn_bdays=gap_warn_bdays,
         refetch_gaps=refetch_gaps,
+        use_stooq_fallback=use_stooq_fallback,
     )
 
     if args.benchmark not in prices.columns:
