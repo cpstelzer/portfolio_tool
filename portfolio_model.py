@@ -180,7 +180,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--tax",
         action="store_true",
         default=False,
-        help="Run Austrian KESt (27.5%) tax simulation and print yearly summary",
+        help="Run Austrian KESt (27.5%%) tax simulation and print yearly summary",
     )
     parser.add_argument(
         "--spike-threshold",
@@ -767,8 +767,11 @@ def fetch_prices(
     # After cache+refetch, any interior gap larger than the threshold means
     # yfinance has no data for that range. The unconditional ffill below will
     # mask it; warn so the user knows the TWR is being held flat there.
+    # Restrict the check to the analysis window so gaps outside [start, end]
+    # don't produce noise.
     for ticker, series in all_frames.items():
-        residual_gaps = _detect_cache_gaps(series, gap_warn_bdays)
+        windowed = series.loc[start:end]
+        residual_gaps = _detect_cache_gaps(windowed, gap_warn_bdays)
         for gap_s, gap_e in residual_gaps:
             n_bd = len(pd.bdate_range(gap_s, gap_e))
             warnings.warn(
