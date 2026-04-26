@@ -65,9 +65,50 @@ from typing import Optional
 
 import numpy as np
 import pandas as pd
+import yaml
 import yfinance as yf
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
+
+
+# ---------------------------------------------------------------------------
+# 0. Configuration (config.yml)
+# ---------------------------------------------------------------------------
+
+@dataclass
+class CacheConfig:
+    gap_warn_business_days: int = 5
+
+
+@dataclass
+class AppConfig:
+    cache: CacheConfig = field(default_factory=CacheConfig)
+
+
+def _load_config(path: Path | None = None) -> AppConfig:
+    """
+    Load configuration from config.yml next to this module.
+    Missing file → defaults. Malformed file → fail loudly.
+    """
+    cfg_path = path or (Path(__file__).resolve().parent / "config.yml")
+    if not cfg_path.exists():
+        return AppConfig()
+    try:
+        with cfg_path.open("r", encoding="utf-8") as f:
+            data = yaml.safe_load(f) or {}
+    except yaml.YAMLError as e:
+        sys.exit(f"[ERROR] Failed to parse {cfg_path}: {e}")
+    if not isinstance(data, dict):
+        sys.exit(f"[ERROR] {cfg_path}: top-level must be a mapping.")
+    cache_data = data.get("cache") or {}
+    if not isinstance(cache_data, dict):
+        sys.exit(f"[ERROR] {cfg_path}: 'cache' must be a mapping.")
+    return AppConfig(
+        cache=CacheConfig(
+            gap_warn_business_days=int(cache_data.get(
+                "gap_warn_business_days", CacheConfig.gap_warn_business_days)),
+        ),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -171,9 +212,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--cache-dir",
         type=Path,
-        default=Path.home() / ".portfolio_cache",
+        default=Path(__file__).resolve().parent / "data",
         dest="cache_dir",
-        help="Directory for local price cache (default: ~/.portfolio_cache/)",
+        help="Directory for local price cache (default: <repo>/data/)",
+    )
+    parser.add_argument(
+        "--no-cache-gap-refetch",
+        action="store_true",
+        default=False,
+        dest="no_cache_gap_refetch",
+        help="Detect and warn on interior cache gaps but do not refetch them",
     )
     return parser.parse_args(argv)
 
@@ -539,6 +587,41 @@ def _save_cache(cache_dir: Path, ticker: str, df: pd.DataFrame) -> None:
     df.to_csv(p, index_label="date")
 
 
+def _detect_cache_gaps(
+    series: pd.Series,
+    threshold_bdays: int,
+) -> list[tuple[pd.Timestamp, pd.Timestamp]]:
+    """
+    Find interior gaps in a daily-ish price series.
+
+    A gap is a span of consecutive *missing* business days strictly
+    between two existing rows. yfinance never returns weekends or
+    exchange holidays, so the threshold is in business days to avoid
+    false positives over normal weekends/holiday weeks.
+
+    Returns a list of (gap_start, gap_end) inclusive ranges, where
+    gap_start = (prev_row + 1 calendar day) and gap_end = (next_row -
+    1 calendar day). Empty list when the series has no gaps exceeding
+    the threshold.
+    """
+    if series is None or series.empty or threshold_bdays < 0:
+        return []
+    idx = series.dropna().index.sort_values()
+    if len(idx) < 2:
+        return []
+    gaps: list[tuple[pd.Timestamp, pd.Timestamp]] = []
+    one_day = pd.Timedelta(days=1)
+    for prev, curr in zip(idx[:-1], idx[1:]):
+        gap_start = prev + one_day
+        gap_end = curr - one_day
+        if gap_start > gap_end:
+            continue
+        n_bdays = len(pd.bdate_range(gap_start, gap_end))
+        if n_bdays > threshold_bdays:
+            gaps.append((gap_start, gap_end))
+    return gaps
+
+
 def _download_prices_raw(
     tickers: list[str],
     start: str,
@@ -578,6 +661,8 @@ def fetch_prices(
     no_cache: bool = False,
     verbose: bool = False,
     spike_threshold: float = 0.15,
+    gap_warn_bdays: int = 5,
+    refetch_gaps: bool = True,
 ) -> pd.DataFrame:
     """
     Download (or load from cache) adjusted-close prices for all tickers.
@@ -594,39 +679,59 @@ def fetch_prices(
 
     # ── Per-ticker cache logic ───────────────────────────────────────────────
     all_frames: dict[str, pd.Series] = {}
-    need_download: dict[str, tuple[str, str]] = {}  # ticker → (dl_start, dl_end)
+    # ticker → list of (dl_start, dl_end) ranges to fetch (dl_end exclusive,
+    # matching yfinance semantics).
+    need_download: dict[str, list[tuple[str, str]]] = {}
 
     for ticker in tickers:
         if cache_dir is not None and not no_cache:
             cached = _load_cache(cache_dir, ticker)
             if cached is not None and not cached.empty and "close" in cached.columns:
+                cached_series = cached["close"]
                 last_cached = cached.index.max()
                 target_end = pd.Timestamp(end)
-                if last_cached >= target_end - pd.Timedelta(days=2):
-                    # Cache is up to date
-                    s = cached["close"].loc[start:]
-                    all_frames[ticker] = s
-                    if verbose:
-                        print(f"[VERBOSE] Cache hit for {ticker}: {len(s)} rows "
-                              f"(last={last_cached.date()})")
-                    continue
-                else:
-                    # Partial cache — download the missing tail
-                    dl_start = (last_cached + pd.Timedelta(days=1)).strftime("%Y-%m-%d")
-                    need_download[ticker] = (dl_start, end)
-                    all_frames[ticker] = cached["close"]
-                    if verbose:
-                        print(f"[VERBOSE] Partial cache for {ticker}; "
-                              f"downloading from {dl_start}")
-                    continue
-        need_download[ticker] = (start, end)
+                ranges_for_ticker: list[tuple[str, str]] = []
 
-    # Batch download needed tickers grouped by (start, end)
+                # Tail refetch when the cache hasn't been updated to the
+                # requested end date.
+                if last_cached < target_end - pd.Timedelta(days=2):
+                    dl_start = (last_cached + pd.Timedelta(days=1)).strftime("%Y-%m-%d")
+                    ranges_for_ticker.append((dl_start, end))
+
+                # Interior-gap refetch: any span of consecutive missing
+                # business days inside the cache that exceeds the threshold.
+                if refetch_gaps:
+                    gaps = _detect_cache_gaps(cached_series, gap_warn_bdays)
+                    for gap_s, gap_e in gaps:
+                        n_bd = len(pd.bdate_range(gap_s, gap_e))
+                        print(f"[INFO] {ticker}: detected interior cache gap "
+                              f"{gap_s.date()} → {gap_e.date()} ({n_bd} business "
+                              f"days); scheduling refetch.")
+                        ranges_for_ticker.append((
+                            gap_s.strftime("%Y-%m-%d"),
+                            (gap_e + pd.Timedelta(days=1)).strftime("%Y-%m-%d"),
+                        ))
+
+                all_frames[ticker] = cached_series
+                if ranges_for_ticker:
+                    need_download[ticker] = ranges_for_ticker
+                    if verbose:
+                        print(f"[VERBOSE] {ticker}: {len(ranges_for_ticker)} "
+                              f"refetch range(s) scheduled")
+                else:
+                    if verbose:
+                        print(f"[VERBOSE] Cache hit for {ticker}: "
+                              f"{len(cached_series)} rows (last={last_cached.date()})")
+                continue
+        need_download[ticker] = [(start, end)]
+
+    # Batch download needed tickers grouped by (start, end) so multiple
+    # tickers sharing a range hit yfinance in a single call.
     if need_download:
-        # Group tickers with the same date range for efficiency
         ranges: dict[tuple[str, str], list[str]] = {}
-        for ticker, (dl_s, dl_e) in need_download.items():
-            ranges.setdefault((dl_s, dl_e), []).append(ticker)
+        for ticker, dl_ranges in need_download.items():
+            for (dl_s, dl_e) in dl_ranges:
+                ranges.setdefault((dl_s, dl_e), []).append(ticker)
 
         for (dl_s, dl_e), batch in ranges.items():
             print(f"[INFO] Downloading prices for {len(batch)} ticker(s) "
@@ -642,30 +747,37 @@ def fetch_prices(
                     continue
                 new_series = raw_prices[ticker].dropna()
 
-                if cache_dir is not None and not no_cache:
-                    existing = all_frames.get(ticker)
-                    if existing is not None and not existing.empty:
-                        combined = pd.concat([existing, new_series])
-                        combined = combined[~combined.index.duplicated(keep="last")]
-                        combined = combined.sort_index()
-                        all_frames[ticker] = combined
-                        _save_cache(cache_dir, ticker,
-                                    pd.DataFrame({"close": combined}))
-                    else:
-                        all_frames[ticker] = new_series
-                        _save_cache(cache_dir, ticker,
-                                    pd.DataFrame({"close": new_series}))
+                existing = all_frames.get(ticker)
+                if existing is not None and not existing.empty:
+                    combined = pd.concat([existing, new_series])
+                    combined = combined[~combined.index.duplicated(keep="last")]
+                    combined = combined.sort_index()
+                    all_frames[ticker] = combined
                 else:
-                    existing = all_frames.get(ticker)
-                    if existing is not None and not existing.empty:
-                        combined = pd.concat([existing, new_series])
-                        combined = combined[~combined.index.duplicated(keep="last")]
-                        all_frames[ticker] = combined.sort_index()
-                    else:
-                        all_frames[ticker] = new_series
+                    all_frames[ticker] = new_series
+
+                if cache_dir is not None and not no_cache:
+                    _save_cache(cache_dir, ticker,
+                                pd.DataFrame({"close": all_frames[ticker]}))
 
     if not all_frames:
         sys.exit("[ERROR] No price data available after cache/download.")
+
+    # ── Residual-gap warning ────────────────────────────────────────────────
+    # After cache+refetch, any interior gap larger than the threshold means
+    # yfinance has no data for that range. The unconditional ffill below will
+    # mask it; warn so the user knows the TWR is being held flat there.
+    for ticker, series in all_frames.items():
+        residual_gaps = _detect_cache_gaps(series, gap_warn_bdays)
+        for gap_s, gap_e in residual_gaps:
+            n_bd = len(pd.bdate_range(gap_s, gap_e))
+            warnings.warn(
+                f"[WARN] {ticker}: residual price gap {gap_s.date()} → "
+                f"{gap_e.date()} ({n_bd} business days) after refetch. "
+                f"Forward-fill will hold the last known price across this "
+                f"range; portfolio value and TWR will appear flat here.",
+                stacklevel=2,
+            )
 
     # Build wide DataFrame from start to end
     prices = pd.DataFrame(all_frames)
@@ -738,6 +850,8 @@ def fetch_fx_rates(
     no_cache: bool = False,
     verbose: bool = False,
     spike_threshold: float = 0.15,
+    gap_warn_bdays: int = 5,
+    refetch_gaps: bool = True,
 ) -> pd.DataFrame:
     """
     Download daily EUR/foreign FX rates for any non-EUR currencies.
@@ -765,6 +879,8 @@ def fetch_fx_rates(
         no_cache=no_cache,
         verbose=verbose,
         spike_threshold=spike_threshold,
+        gap_warn_bdays=gap_warn_bdays,
+        refetch_gaps=refetch_gaps,
     )
 
     # Rename columns from EURUSD=X → USD
@@ -1765,6 +1881,9 @@ def plot_performance(
 
 def main(argv: list[str] | None = None) -> None:
     args = parse_args(argv)
+    app_config = _load_config()
+    gap_warn_bdays = app_config.cache.gap_warn_business_days
+    refetch_gaps = not args.no_cache_gap_refetch
 
     # ── Clear cache and exit if requested ───────────────────────────────────
     if args.clear_cache:
@@ -1843,6 +1962,8 @@ def main(argv: list[str] | None = None) -> None:
             no_cache=args.no_cache,
             verbose=args.verbose,
             spike_threshold=args.spike_threshold,
+            gap_warn_bdays=gap_warn_bdays,
+            refetch_gaps=refetch_gaps,
         )
         if args.verbose and not fx_rates.empty:
             print(f"[VERBOSE] FX rates tail:\n{fx_rates.tail(5)}")
@@ -1858,6 +1979,8 @@ def main(argv: list[str] | None = None) -> None:
         no_cache=args.no_cache,
         verbose=args.verbose,
         spike_threshold=args.spike_threshold,
+        gap_warn_bdays=gap_warn_bdays,
+        refetch_gaps=refetch_gaps,
     )
 
     if args.benchmark not in prices.columns:
