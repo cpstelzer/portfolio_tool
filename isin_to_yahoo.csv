@@ -14,5 +14,5 @@ IE00B4L5YX21,EUNN.DE,iShares Core MSCI Japan IMI ETF,EUR,equity,XETRA
 IE00B4K48X80,IMAE.AS,iShares Core MSCI Europe ETF (Acc),EUR,equity,Amsterdam - EUNK.DE had data gaps on Yahoo Finance
 IE00B9F5YL18,VGEJ.DE,Vanguard FTSE Dev Asia Pacific ex Japan ETF,EUR,equity,XETRA
 IE00BF4RFH31,IUSN.DE,iShares MSCI World Small Cap ETF,EUR,equity,XETRA
-LU3025345516,XEON.DE,Xtrackers EUR Overnight Rate Swap ETF (proxy),EUR,bond,XETRA - EDEG.DE only launched Jun 2025 (no history); XEON.DE tracks same EUR overnight rate since 2007
+LU3025345516,EDEG.DE,Xtrackers EUR Overnight Rate Swap ETF (proxy),EUR,bond,XETRA - EDEG.DE only launched Jun 2025 (no history); XEON.DE tracks same EUR overnight rate since 2007
 LU2611731824,NC0C.PA,Amundi IS Nasdaq-100 Global Covered Call,EUR,equity,Paris/Euronext - distributing covered-call ETF on Nasdaq-100
