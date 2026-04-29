@@ -230,17 +230,25 @@ Additionally:
 
 ---
 
-### 5. Sell Handling & Cash Tracking
+### 5. Cash Tracking, Deposits & Withdrawals
 
-**Problem.** The cash model is implicit and not well-documented. No withdrawals exist.
+**Original problem.** The cash model was implicit and undocumented; no withdrawals existed.
 
-**Clarifications to encode as documented assumptions (no behavioral change needed):**
+**Resolution.** The model now has two cash modes, selected via `config.yml → clearing_account.use_clearing_account` (default `true`):
 
+**Legacy mode (`use_clearing_account: false`).**
 - Buys are modelled as external capital injection: money enters the portfolio and is immediately converted to shares. Net cash effect of a buy = 0.
 - Sells convert shares to cash. Cash remains in the portfolio.
-- No withdrawals. Cash only grows (from sells) and is never removed.
-- Add a comment block in the code documenting these assumptions.
-- If a `withdrawal` transaction type is ever needed in the future, it would reduce cash and `cumulative_invested`. But this is out of scope now.
+- No deposits or withdrawals. Cash only grows (from sells) and is never removed.
+
+**Clearing-account mode (`use_clearing_account: true`, default).**
+- The broker's `cashflow_detailed.csv` ledger is loaded and classified into `deposit`, `withdrawal`, `trade_leg`, `distribution`, `thesaurierung`, `clearing_interest`, and `unclassified` categories.
+- Empty info fields are reclassified as deposits/withdrawals when the counterparty IBAN contains the configured `reference_iban_suffix`.
+- `cash` is a real running balance: deposits add, withdrawals subtract, optional `Zinsabschluss` interest applies, sells/distributions credit, buys debit.
+- A new series `cumulative_contributed = deposits − withdrawals` is reported alongside the legacy `cumulative_invested` (which still tracks gross buy volume).
+- The summary prints both total-return percentages (gross-invested and net-contributed) plus the **money-weighted return (XIRR)**.
+- The "mirror flows" benchmark mirrors real external flows.
+- Unmatched ledger rows or settlement-quirk negative cash balances emit warnings but do not abort.
 
 ---
 

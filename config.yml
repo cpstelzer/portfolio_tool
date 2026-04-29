@@ -21,3 +21,33 @@ data_sources:
   # required, and often has cleaner data for European ETCs/ETFs where
   # Yahoo struggles. Disable per run with --no-stooq-fallback.
   stooq_fallback: true
+
+clearing_account:
+  # Master switch. When true, the broker's clearing-account ledger
+  # (cashflow_detailed.csv) is loaded and used to drive a real cash
+  # balance and a separate "cumulative contributed" series (net of
+  # deposits and withdrawals). Buys then consume cash instead of being
+  # modelled as fresh external capital injections. When false, the model
+  # behaves as before: buys are treated as external injections, cash
+  # only grows from sells, and no withdrawals exist.
+  use_clearing_account: true
+
+  # Path to the clearing-account CSV (relative to this config file or
+  # absolute). If the file is missing the model warns and falls back to
+  # the legacy behaviour above.
+  path: cashflow_detailed.csv
+
+  # IBAN suffix of your own bank account (the one money is transferred
+  # to/from). Used to recognise own deposits and withdrawals when the
+  # broker's "Buchungsinformationen" field is empty. Compared against
+  # the "Empfänger" / "Zahlungspfl." columns by simple substring match.
+  reference_iban_suffix: "4480"
+
+  # Apply quarterly "Zinsabschluss" (clearing-account interest/fees) to
+  # the cash balance. Amounts are typically tiny.
+  include_clearing_interest: true
+
+  # Emit a warning if the running cash balance ever goes negative.
+  # This usually indicates a settlement-date quirk (a buy that booked
+  # one or two days before its funding deposit) and is allowed.
+  warn_on_negative_cash: true
