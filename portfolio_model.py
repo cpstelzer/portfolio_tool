@@ -361,6 +361,7 @@ def load_broker_transactions(path: Path) -> pd.DataFrame:
 
     df["ticker"] = ""
     df["currency"] = "EUR"   # broker file is always EUR in this implementation
+    df["is_off_broker"] = False
     df = _normalise_id_columns(df)
     df = df.sort_values("date").reset_index(drop=True)
     return df
@@ -414,6 +415,11 @@ def load_legacy_transactions(path: Path) -> pd.DataFrame:
     if "currency" not in df.columns:
         df["currency"] = "EUR"
 
+    # Heuristic: a row with no ISIN in the legacy file is an off-broker
+    # holding (e.g. physical gold, crypto wallet) — it does not move money
+    # through the broker's clearing account.
+    df["is_off_broker"] = (df["ISIN"] == "")
+
     df = df.sort_values("date").reset_index(drop=True)
     return df
 
@@ -450,6 +456,7 @@ def load_manual_transactions(path: Path) -> pd.DataFrame:
     df["ISIN"] = ""
     df["booking_info"] = ""
     df["tx_id"] = ""
+    df["is_off_broker"] = True
 
     df = _normalise_id_columns(df)
     df = df.sort_values("date").reset_index(drop=True)
@@ -655,8 +662,15 @@ def reconcile_cashflow_with_transactions(
     # should match this 1:1). Distribution and thesaurierung rows in the
     # transactions file come as paired negative+positive entries, so a
     # row-count comparison would be misleading and is omitted here.
-    info_upper = transactions.get("booking_info", pd.Series([""] * len(transactions))).fillna("").astype(str).str.upper()
-    n_buy_sell = int(info_upper.str.contains("AUSF").sum())
+    # The legacy simplified format has no booking_info column; in that
+    # case we skip the comparison entirely.
+    info_series = transactions.get("booking_info")
+    has_info = info_series is not None and info_series.fillna("").astype(str).str.strip().ne("").any()
+    if has_info:
+        info_upper = info_series.fillna("").astype(str).str.upper()
+        n_buy_sell = int(info_upper.str.contains("AUSF").sum())
+    else:
+        n_buy_sell = None
 
     def _fmt(cat: str) -> str:
         if cat in by_cat.index:
@@ -670,13 +684,16 @@ def reconcile_cashflow_with_transactions(
     print("=" * 66)
     print(f"  Deposits         : {_fmt('deposit')}")
     print(f"  Withdrawals      : {_fmt('withdrawal')}")
-    print(f"  Trade legs       : {_fmt('trade_leg')}   (vs {n_buy_sell} buy/sell tx)")
+    trade_line = f"  Trade legs       : {_fmt('trade_leg')}"
+    if n_buy_sell is not None:
+        trade_line += f"   (vs {n_buy_sell} buy/sell tx)"
+    print(trade_line)
     print(f"  Distributions    : {_fmt('distribution')}")
     print(f"  Thesaurierungen  : {_fmt('thesaurierung')}")
     print(f"  Clearing interest: {_fmt('clearing_interest')}")
     print(f"  Unclassified     : {_fmt('unclassified')}")
     n_trade_legs = int(by_cat.loc["trade_leg", "count"]) if "trade_leg" in by_cat.index else 0
-    if n_trade_legs != n_buy_sell:
+    if n_buy_sell is not None and n_trade_legs != n_buy_sell:
         print(f"  [WARN] Trade-leg count ({n_trade_legs}) differs from buy/sell tx count ({n_buy_sell}).")
     print("=" * 66)
 
@@ -1935,6 +1952,12 @@ def reconstruct_portfolio(
 
                 px_eur = price_to_eur(px_native, cur, fx_used)
                 cost_eur = shares * px_eur  # positive = buy, negative = sell proceeds
+                # Off-broker assets (e.g. physical gold, crypto wallet) do
+                # not move money through the broker's clearing account.
+                # In clearing-account mode we treat them as in-kind
+                # contributions/withdrawals: they update positions and
+                # cumulative_contributed but never touch cash.
+                is_off = bool(tx.get("is_off_broker", False)) and use_clearing
 
                 if tx_type == "buy" or (tx_type not in ("sell",) and shares > 0):
                     # Buy: gross invested volume always increases. Cash is
@@ -1946,6 +1969,9 @@ def reconstruct_portfolio(
                         cash += cost_eur
                     cumulative_invested += cost_eur
                     day_invested += cost_eur
+                    if is_off:
+                        cumulative_contributed += cost_eur
+                        external_flows[day] = external_flows.get(day, 0.0) + cost_eur
                     if run_tax:
                         lot_ledger.add_lot(Lot(
                             ticker=ticker,
@@ -1985,8 +2011,14 @@ def reconstruct_portfolio(
                                     "cumulative_tax": round(cumulative_tax, 4),
                                 })
                     day_invested += cost_eur   # negative
+                    if is_off:
+                        # In-kind withdrawal: cost_eur is negative, so this
+                        # decreases cumulative_contributed and external_flows.
+                        cumulative_contributed += cost_eur
+                        external_flows[day] = external_flows.get(day, 0.0) + cost_eur
 
-                cash -= cost_eur   # buy: nets to 0; sell: cash increases
+                if not is_off:
+                    cash -= cost_eur   # buy: nets to 0; sell: cash increases
                 positions[ticker] = positions.get(ticker, 0.0) + shares
 
         if use_clearing:
@@ -2450,10 +2482,12 @@ def plot_performance(
     bm_metrics: dict,
     tax_timeline: Optional[pd.DataFrame] = None,
     show_tax: bool = False,
+    portfolio_twr_broker: Optional[pd.Series] = None,
 ) -> None:
     """
     Multi-panel chart:
-      Panel 1: TWR comparison (portfolio vs benchmark)
+      Panel 1: TWR comparison (portfolio vs benchmark, plus optional
+               broker-only TWR when off-broker assets exist)
       Panel 2: Stacked area — cumulative_invested vs cumulative_gain
       Panel 3: Rolling 1-year return
       Panel 4 (optional, if show_tax): cumulative tax paid
@@ -2469,13 +2503,23 @@ def plot_performance(
 
     # ── Panel 1: TWR ─────────────────────────────────────────────────────────
     ax_twr.plot(portfolio_twr.index, portfolio_twr.values,
-                label="Portfolio", linewidth=2)
+                label="Portfolio (incl. off-broker)" if portfolio_twr_broker is not None else "Portfolio",
+                linewidth=2)
+    if portfolio_twr_broker is not None:
+        clean = portfolio_twr_broker.dropna()
+        if not clean.empty:
+            ax_twr.plot(clean.index, clean.values,
+                        label="Portfolio (broker-only)",
+                        linewidth=1.8, linestyle="-.", color="#7f3fbf")
     bm_label = f"Benchmark ({benchmark_ticker})"
     bm_label += " [buy-and-hold]" if buy_and_hold else " [mirror flows]"
     ax_twr.plot(benchmark_twr.index, benchmark_twr.values,
                 label=bm_label, linewidth=2, linestyle="--")
     ax_twr.axhline(1.0, color="grey", linewidth=0.8, linestyle=":")
-    ax_twr.set_title("Portfolio vs Benchmark — Time-Weighted Return (TWR)", fontsize=13)
+    title = "Portfolio vs Benchmark — Time-Weighted Return (TWR)"
+    if portfolio_twr_broker is not None:
+        title += "\nBroker-only excludes assets held outside the broker (e.g. physical metals, crypto wallets)"
+    ax_twr.set_title(title, fontsize=13)
     ax_twr.set_ylabel("TWR Index (start = 1.0)")
     ax_twr.legend()
 
@@ -2722,12 +2766,34 @@ def main(argv: list[str] | None = None) -> None:
     )
     cash_flows: pd.Series = portfolio_df.cash_flows  # type: ignore[attr-defined]
 
+    # ── Optional broker-only reconstruction (excludes off-broker assets) ────
+    has_off_broker = bool(transactions.get("is_off_broker", pd.Series(dtype=bool)).any())
+    portfolio_df_broker: Optional[pd.DataFrame] = None
+    if has_off_broker:
+        broker_only_txs = transactions[~transactions["is_off_broker"].astype(bool)].copy()
+        if not broker_only_txs.empty:
+            portfolio_df_broker = reconstruct_portfolio(
+                broker_only_txs, isin_to_ticker, isin_to_currency,
+                prices, fx_rates,
+                run_tax=False,
+                verbose=False,
+                cashflow_ledger=cashflow_ledger,
+                include_clearing_interest=ca_cfg.include_clearing_interest,
+                warn_on_negative_cash=False,
+            )
+
     # ── Benchmark simulation ─────────────────────────────────────────────────
     benchmark_df = simulate_benchmark(cash_flows, prices[args.benchmark], args.buy_and_hold)
 
     # ── TWR ──────────────────────────────────────────────────────────────────
     pv_twr = compute_twr(portfolio_df["portfolio_value"], portfolio_df["value_before_tx"])
     bv_twr = compute_twr(benchmark_df["benchmark_value"], benchmark_df["value_before_tx"])
+    pv_twr_broker: Optional[pd.Series] = None
+    if portfolio_df_broker is not None:
+        pv_twr_broker = compute_twr(
+            portfolio_df_broker["portfolio_value"],
+            portfolio_df_broker["value_before_tx"],
+        )
 
     common_idx = pv_twr.dropna().index.intersection(bv_twr.dropna().index)
     if common_idx.empty:
@@ -2738,6 +2804,13 @@ def main(argv: list[str] | None = None) -> None:
 
     pv_twr = pv_twr / pv_twr.iloc[0]
     bv_twr = bv_twr / bv_twr.iloc[0]
+
+    if pv_twr_broker is not None:
+        pv_twr_broker = pv_twr_broker.reindex(common_idx)
+        first_valid = pv_twr_broker.dropna()
+        pv_twr_broker = (
+            pv_twr_broker / first_valid.iloc[0] if not first_valid.empty else pv_twr_broker
+        )
 
     # ── Verbose diagnostics ──────────────────────────────────────────────────
     if args.verbose:
@@ -2782,8 +2855,12 @@ def main(argv: list[str] | None = None) -> None:
         print("=" * 70 + "\n")
 
     # ── Metrics ──────────────────────────────────────────────────────────────
-    pm = compute_metrics(pv_twr, "Portfolio")
+    pf_label = "Portfolio (incl. off-broker)" if pv_twr_broker is not None else "Portfolio"
+    pm = compute_metrics(pv_twr, pf_label)
     bm = compute_metrics(bv_twr, f"Benchmark ({args.benchmark})")
+    pm_broker: dict = {}
+    if pv_twr_broker is not None and not pv_twr_broker.dropna().empty:
+        pm_broker = compute_metrics(pv_twr_broker.dropna(), "Portfolio (broker-only)")
 
     # Benchmark correlation
     pf_ret = pv_twr.pct_change().dropna()
@@ -2797,11 +2874,25 @@ def main(argv: list[str] | None = None) -> None:
         pm["benchmark_correlation"] = "n/a"
         bm["benchmark_correlation"] = "n/a"
 
+    if pm_broker:
+        pf_b_ret = pv_twr_broker.dropna().pct_change().dropna()
+        common_b = pf_b_ret.index.intersection(bm_ret.index)
+        if len(common_b) > 1:
+            pm_broker["benchmark_correlation"] = round(
+                pf_b_ret.loc[common_b].corr(bm_ret.loc[common_b]), 4
+            )
+        else:
+            pm_broker["benchmark_correlation"] = "n/a"
+
     # ── Performance summary ──────────────────────────────────────────────────
     print("\n" + "=" * 66)
     print("  PERFORMANCE SUMMARY  (Time-Weighted Return)")
     print("=" * 66)
-    for metrics in (pm, bm):
+    summary_metrics = [pm]
+    if pm_broker:
+        summary_metrics.append(pm_broker)
+    summary_metrics.append(bm)
+    for metrics in summary_metrics:
         print(f"\n  {metrics['label']}")
         print(f"    Period               : {metrics['start_date']} → {metrics['end_date']}")
         print(f"    Trading days         : {metrics['trading_days']}")
@@ -2889,6 +2980,7 @@ def main(argv: list[str] | None = None) -> None:
             portfolio_df, pm, bm,
             tax_timeline=portfolio_df.tax_timeline,  # type: ignore[attr-defined]
             show_tax=args.tax,
+            portfolio_twr_broker=pv_twr_broker,
         )
 
 
