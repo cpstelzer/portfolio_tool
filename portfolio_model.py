@@ -17,21 +17,35 @@ Assets can be identified in two ways:
 
 Cash / sell model assumptions
 ------------------------------
-  • Buys are modelled as external capital injection: money enters the
-    portfolio and is immediately converted to shares. Net cash effect
-    of a buy = 0; cumulative_invested increases by the cost.
-  • Sells convert shares to cash that remains inside the portfolio.
-    Cash only grows (from sell proceeds) and is never withdrawn.
-  • Ausschüttung (cash distributions) are added to portfolio cash and
-    do NOT reduce cumulative_invested; they represent income, not a
-    return of capital.
-  • No withdrawals are modelled. If a withdrawal transaction type is
-    ever added it would reduce both cash and cumulative_invested, but
-    that is out of scope for v2.
-  • TWR uses Yahoo Finance adjusted-close prices (dividends reinvested
-    in the price series). Cash-distribution tracking and tax simulation
-    use broker-reported amounts. These are intentionally different views
-    of the same underlying economic events.
+There are two cash models, selected via config.yml:
+
+  Legacy mode (clearing_account.use_clearing_account = false):
+    • Buys are modelled as external capital injection: money enters the
+      portfolio and is immediately converted to shares. Net cash effect
+      of a buy = 0; cumulative_invested increases by the cost.
+    • Sells convert shares to cash that remains inside the portfolio.
+      Cash only grows (from sell proceeds) and is never withdrawn.
+    • No deposits or withdrawals are modelled.
+
+  Clearing-account mode (default, use_clearing_account = true):
+    • The broker's cashflow_detailed.csv ledger drives a real running
+      cash balance. Deposits add to cash, withdrawals subtract from it,
+      and (optionally) quarterly Zinsabschluss interest is applied.
+    • Buys consume cash; the cash to fund a buy must already have been
+      deposited. cumulative_invested still tracks gross buy volume.
+    • A new series cumulative_contributed = deposits − withdrawals
+      reflects net capital actually put in, and is used for the
+      money-weighted return (XIRR) and the "net" total-return figure.
+    • The "mirror flows" benchmark mirrors real external flows.
+
+  Common to both modes:
+    • Ausschüttung (cash distributions) are added to portfolio cash and
+      do NOT reduce cumulative_invested; they represent income, not a
+      return of capital.
+    • TWR uses Yahoo Finance adjusted-close prices (dividends reinvested
+      in the price series). Cash-distribution tracking and tax simulation
+      use broker-reported amounts. These are intentionally different views
+      of the same underlying economic events.
 
 Usage:
     python portfolio_model.py transactions_detailed.csv isin_to_yahoo.csv \
@@ -86,9 +100,19 @@ class DataSourcesConfig:
 
 
 @dataclass
+class ClearingAccountConfig:
+    use_clearing_account: bool = True
+    path: str = "cashflow_detailed.csv"
+    reference_iban_suffix: str = "4480"
+    include_clearing_interest: bool = True
+    warn_on_negative_cash: bool = True
+
+
+@dataclass
 class AppConfig:
     cache: CacheConfig = field(default_factory=CacheConfig)
     data_sources: DataSourcesConfig = field(default_factory=DataSourcesConfig)
+    clearing_account: ClearingAccountConfig = field(default_factory=ClearingAccountConfig)
 
 
 def _load_config(path: Path | None = None) -> AppConfig:
@@ -112,6 +136,9 @@ def _load_config(path: Path | None = None) -> AppConfig:
     ds_data = data.get("data_sources") or {}
     if not isinstance(ds_data, dict):
         sys.exit(f"[ERROR] {cfg_path}: 'data_sources' must be a mapping.")
+    ca_data = data.get("clearing_account") or {}
+    if not isinstance(ca_data, dict):
+        sys.exit(f"[ERROR] {cfg_path}: 'clearing_account' must be a mapping.")
     return AppConfig(
         cache=CacheConfig(
             gap_warn_business_days=int(cache_data.get(
@@ -120,6 +147,18 @@ def _load_config(path: Path | None = None) -> AppConfig:
         data_sources=DataSourcesConfig(
             stooq_fallback=bool(ds_data.get(
                 "stooq_fallback", DataSourcesConfig.stooq_fallback)),
+        ),
+        clearing_account=ClearingAccountConfig(
+            use_clearing_account=bool(ca_data.get(
+                "use_clearing_account", ClearingAccountConfig.use_clearing_account)),
+            path=str(ca_data.get(
+                "path", ClearingAccountConfig.path)),
+            reference_iban_suffix=str(ca_data.get(
+                "reference_iban_suffix", ClearingAccountConfig.reference_iban_suffix)),
+            include_clearing_interest=bool(ca_data.get(
+                "include_clearing_interest", ClearingAccountConfig.include_clearing_interest)),
+            warn_on_negative_cash=bool(ca_data.get(
+                "warn_on_negative_cash", ClearingAccountConfig.warn_on_negative_cash)),
         ),
     )
 
@@ -322,6 +361,7 @@ def load_broker_transactions(path: Path) -> pd.DataFrame:
 
     df["ticker"] = ""
     df["currency"] = "EUR"   # broker file is always EUR in this implementation
+    df["is_off_broker"] = False
     df = _normalise_id_columns(df)
     df = df.sort_values("date").reset_index(drop=True)
     return df
@@ -375,6 +415,11 @@ def load_legacy_transactions(path: Path) -> pd.DataFrame:
     if "currency" not in df.columns:
         df["currency"] = "EUR"
 
+    # Heuristic: a row with no ISIN in the legacy file is an off-broker
+    # holding (e.g. physical gold, crypto wallet) — it does not move money
+    # through the broker's clearing account.
+    df["is_off_broker"] = (df["ISIN"] == "")
+
     df = df.sort_values("date").reset_index(drop=True)
     return df
 
@@ -411,6 +456,7 @@ def load_manual_transactions(path: Path) -> pd.DataFrame:
     df["ISIN"] = ""
     df["booking_info"] = ""
     df["tx_id"] = ""
+    df["is_off_broker"] = True
 
     df = _normalise_id_columns(df)
     df = df.sort_values("date").reset_index(drop=True)
@@ -435,6 +481,230 @@ def load_transactions(path: Path) -> pd.DataFrame:
     except Exception:
         pass
     return load_legacy_transactions(path)
+
+
+CASHFLOW_CATEGORIES = (
+    "deposit", "withdrawal", "trade_leg", "distribution",
+    "thesaurierung", "clearing_interest", "unclassified",
+)
+
+
+def _classify_cashflow_row(
+    info: str,
+    amount: float,
+    counterparty_in: str,
+    counterparty_out: str,
+    reference_iban_suffix: str,
+) -> tuple[str, bool]:
+    """
+    Classify one ledger row by its 'Buchungsinformationen' text and amount.
+
+    Returns (category, was_iban_fallback). The fallback flag is True only
+    when we had to rely on the reference IBAN suffix to recognise an
+    own-account deposit or withdrawal.
+    """
+    text = (info or "").strip()
+    upper = text.upper()
+
+    # Direct text-based classification.
+    if "ZINSABSCHLUSS" in upper:
+        return "clearing_interest", False
+    if "AUSF" in upper and "KAUF" in upper:
+        return "trade_leg", False
+    if "AUSF" in upper and "VERKAUF" in upper:
+        return "trade_leg", False
+    if "THESAURIERUNG" in upper:
+        return "thesaurierung", False
+    if "ERTR" in upper and ("AUSSCH" in upper or "GNIS" in upper):
+        return "distribution", False
+    if "CODE: SCOR" in upper:
+        return "deposit" if amount > 0 else "withdrawal", False
+    if "BEKANNT" in upper or "RUECKUEBERWEISUNG" in upper or "RÜCKÜBERWEISUNG" in upper:
+        return "deposit" if amount > 0 else "withdrawal", False
+
+    # IBAN-suffix fallback for empty/unrecognised info.
+    # The broker records the external bank account in the same column
+    # regardless of direction, so check both Empfänger and Zahlungspfl.
+    # The amount sign tells us which side the money is moving.
+    suffix = (reference_iban_suffix or "").strip()
+    if suffix and (suffix in counterparty_in or suffix in counterparty_out):
+        return ("deposit" if amount > 0 else "withdrawal"), True
+
+    return "unclassified", False
+
+
+def load_cashflow_ledger(
+    path: Path,
+    reference_iban_suffix: str,
+    verbose: bool = False,
+) -> pd.DataFrame:
+    """
+    Load the broker's clearing-account ledger (cashflow_detailed.csv).
+
+    Expected columns (Latin-1 encoded German export):
+        Buchungstag, Valuta, Empfänger, Zahlungspfl., TA.Nr.,
+        Buchungsinformationen, Betrag, Currency
+
+    Returns a DataFrame indexed by row number with columns:
+        valuta            — booking value-date (pd.Timestamp)
+        buchungstag       — booking date (pd.Timestamp)
+        category          — one of CASHFLOW_CATEGORIES
+        amount_eur        — float (positive = credit, negative = debit)
+        ta_nr             — broker TA-number string
+        info              — original Buchungsinformationen string
+        counterparty      — Empfänger (credit side) or Zahlungspfl. (debit side)
+        iban_fallback     — True if classification used the IBAN-suffix fallback
+    """
+    raw = pd.read_csv(path, encoding="latin-1", header=0)
+    raw.columns = [c.strip() for c in raw.columns]
+
+    # Tolerate slightly different column names from different exports.
+    def _col(*candidates: str) -> str:
+        for c in candidates:
+            if c in raw.columns:
+                return c
+        sys.exit(
+            f"[ERROR] {path}: cashflow ledger missing one of columns {candidates}; "
+            f"got {list(raw.columns)}"
+        )
+
+    col_buchung = _col("Buchungstag")
+    col_valuta = _col("Valuta")
+    col_recv = _col("Empfänger", "Empfaenger")
+    col_pay = _col("Zahlungspfl.", "Zahlungspfl", "Zahlungspflichtiger")
+    col_tanr = _col("TA.Nr.", "TA-Nr.", "TA.-Nr.", "TA.Nr")
+    col_info = _col("Buchungsinformationen", "Buchungsinformation")
+    col_amt = _col("Betrag")
+
+    df = pd.DataFrame({
+        "buchungstag": _parse_dates(raw[col_buchung]),
+        "valuta": _parse_dates(raw[col_valuta]),
+        "counterparty_in": raw[col_recv].fillna("").astype(str).str.strip(),
+        "counterparty_out": raw[col_pay].fillna("").astype(str).str.strip(),
+        "ta_nr": raw[col_tanr].fillna("").astype(str).str.strip(),
+        "info": raw[col_info].fillna("").astype(str).str.strip(),
+        "amount_eur": pd.to_numeric(raw[col_amt], errors="coerce"),
+    })
+
+    bad_dates = df["valuta"].isna()
+    if bad_dates.any():
+        rows = (df.index[bad_dates] + 2).tolist()
+        sys.exit(f"[ERROR] {path}: unparseable Valuta dates in rows {rows}.")
+
+    bad_amt = df["amount_eur"].isna()
+    if bad_amt.any():
+        rows = (df.index[bad_amt] + 2).tolist()
+        sys.exit(f"[ERROR] {path}: unparseable Betrag values in rows {rows}.")
+
+    cats: list[str] = []
+    fallbacks: list[bool] = []
+    for _, r in df.iterrows():
+        cat, was_fb = _classify_cashflow_row(
+            r["info"], float(r["amount_eur"]),
+            r["counterparty_in"], r["counterparty_out"],
+            reference_iban_suffix,
+        )
+        cats.append(cat)
+        fallbacks.append(was_fb)
+    df["category"] = cats
+    df["iban_fallback"] = fallbacks
+    df["counterparty"] = np.where(
+        df["amount_eur"] > 0, df["counterparty_in"], df["counterparty_out"]
+    )
+
+    # Inform the user about IBAN-fallback resolutions and remaining
+    # unclassified rows (the latter is a real warning).
+    fb_rows = df[df["iban_fallback"]]
+    for _, r in fb_rows.iterrows():
+        warnings.warn(
+            f"[INFO] Cashflow row on {r['valuta'].date()} (TA {r['ta_nr']}, "
+            f"EUR {r['amount_eur']:.2f}): empty info field; classified as "
+            f"{r['category']} via reference-IBAN match.",
+            stacklevel=2,
+        )
+    unc = df[df["category"] == "unclassified"]
+    for _, r in unc.iterrows():
+        warnings.warn(
+            f"[WARN] Cashflow row on {r['valuta'].date()} (TA {r['ta_nr']}, "
+            f"EUR {r['amount_eur']:.2f}, info='{r['info']}') could not be "
+            f"classified and will be ignored.",
+            stacklevel=2,
+        )
+
+    if verbose:
+        counts = df["category"].value_counts().to_dict()
+        print("[VERBOSE] Cashflow ledger category counts:")
+        for cat in CASHFLOW_CATEGORIES:
+            if cat in counts:
+                print(f"    {cat:18s} {counts[cat]:4d}")
+
+    df = df.drop(columns=["counterparty_in", "counterparty_out"])
+    df = df.sort_values("valuta").reset_index(drop=True)
+    return df
+
+
+def reconcile_cashflow_with_transactions(
+    cashflow: pd.DataFrame,
+    transactions: pd.DataFrame,
+    verbose: bool = False,
+) -> None:
+    """
+    Print a one-line-per-category reconciliation report comparing the
+    clearing-account ledger to the transactions file. Strictly
+    informational — never aborts.
+    """
+    if cashflow.empty:
+        return
+
+    by_cat = cashflow.groupby("category")["amount_eur"].agg(["count", "sum"])
+
+    # Count buy/sell rows in the transactions file (cashflow trade-legs
+    # should match this 1:1). Distribution and thesaurierung rows in the
+    # transactions file come as paired negative+positive entries, so a
+    # row-count comparison would be misleading and is omitted here.
+    # The legacy simplified format has no booking_info column; in that
+    # case we skip the comparison entirely.
+    info_series = transactions.get("booking_info")
+    has_info = info_series is not None and info_series.fillna("").astype(str).str.strip().ne("").any()
+    if has_info:
+        info_upper = info_series.fillna("").astype(str).str.upper()
+        n_buy_sell = int(info_upper.str.contains("AUSF").sum())
+    else:
+        n_buy_sell = None
+
+    def _fmt(cat: str) -> str:
+        if cat in by_cat.index:
+            n = int(by_cat.loc[cat, "count"])
+            s = float(by_cat.loc[cat, "sum"])
+            return f"{n:4d} entries, EUR {s:>14,.2f}"
+        return "   0 entries"
+
+    print("\n" + "=" * 66)
+    print("  CLEARING-ACCOUNT RECONCILIATION")
+    print("=" * 66)
+    print(f"  Deposits         : {_fmt('deposit')}")
+    print(f"  Withdrawals      : {_fmt('withdrawal')}")
+    trade_line = f"  Trade legs       : {_fmt('trade_leg')}"
+    if n_buy_sell is not None:
+        trade_line += f"   (vs {n_buy_sell} buy/sell tx)"
+    print(trade_line)
+    print(f"  Distributions    : {_fmt('distribution')}")
+    print(f"  Thesaurierungen  : {_fmt('thesaurierung')}")
+    print(f"  Clearing interest: {_fmt('clearing_interest')}")
+    print(f"  Unclassified     : {_fmt('unclassified')}")
+    n_trade_legs = int(by_cat.loc["trade_leg", "count"]) if "trade_leg" in by_cat.index else 0
+    if n_buy_sell is not None and n_trade_legs != n_buy_sell:
+        print(f"  [WARN] Trade-leg count ({n_trade_legs}) differs from buy/sell tx count ({n_buy_sell}).")
+    print("=" * 66)
+
+    if verbose:
+        unc = cashflow[cashflow["category"] == "unclassified"]
+        if not unc.empty:
+            print("\n  Unclassified rows:")
+            for _, r in unc.iterrows():
+                print(f"    {r['valuta'].date()} TA={r['ta_nr']} "
+                      f"EUR {r['amount_eur']:>10,.2f}  info='{r['info']}'")
+            print()
 
 
 def load_lookup(path: Path) -> tuple[dict[str, str], dict[str, str], dict[str, str]]:
@@ -1360,21 +1630,36 @@ def reconstruct_portfolio(
     fx_rates: pd.DataFrame,
     run_tax: bool = False,
     verbose: bool = False,
+    cashflow_ledger: Optional[pd.DataFrame] = None,
+    include_clearing_interest: bool = True,
+    warn_on_negative_cash: bool = True,
 ) -> pd.DataFrame:
     """
     Returns a DataFrame indexed by trading date with columns:
-        value_before_tx    — portfolio EUR value before today's transactions
-        portfolio_value    — portfolio EUR value after today's transactions
-        cash               — EUR cash held
-        cumulative_invested — running sum of capital injected (EUR)
-        cumulative_gain    — portfolio_value − cumulative_invested
+        value_before_tx        — portfolio EUR value before today's transactions
+        portfolio_value        — portfolio EUR value after today's transactions
+        cash                   — EUR cash held
+        cumulative_invested    — running sum of gross buy cost (EUR)
+        cumulative_contributed — net deposits − withdrawals (EUR);
+                                 only meaningful when cashflow_ledger is given,
+                                 otherwise mirrors cumulative_invested.
+        cumulative_gain        — portfolio_value − cumulative_invested
 
     Attributes on the returned DataFrame:
-        .cash_flows     — pd.Series of net capital deployed per day
+        .cash_flows     — pd.Series of net capital deployed per day; when a
+                          cashflow_ledger is provided this reflects real
+                          deposits/withdrawals, otherwise trade-implied flows.
+        .external_flows — pd.Series of (deposit − withdrawal) per day, only
+                          when cashflow_ledger is provided; empty otherwise.
         .lot_ledger     — LotLedger (for §3 tax simulation)
         .tax_timeline   — pd.DataFrame (filled only when run_tax=True)
         .final_positions — dict ticker → shares
         .ticker_currency — dict ticker → currency
+
+    When `cashflow_ledger` is provided the cash model switches from the
+    legacy "buys are external injections" view to a real running cash
+    balance fed by deposits, withdrawals and (optionally) clearing-account
+    interest. Buys then consume cash; sells/distributions add to it.
     """
     transactions = transactions.copy()
     transactions["_yf_ticker"] = resolve_tickers(transactions, isin_to_ticker)
@@ -1477,20 +1762,70 @@ def reconstruct_portfolio(
     for (isin_val, date_val), pairs in paired_ausschuettung.items():
         ausSch_by_date.setdefault(date_val, []).append((isin_val, pairs))
 
+    # ── External cashflows (deposits / withdrawals / clearing interest) ─────
+    use_clearing = cashflow_ledger is not None and not cashflow_ledger.empty
+    deposits_by_day: dict[pd.Timestamp, float] = {}
+    withdrawals_by_day: dict[pd.Timestamp, float] = {}
+    interest_by_day: dict[pd.Timestamp, float] = {}
+    if use_clearing:
+        ledger = cashflow_ledger.copy()
+        ledger["snap"] = _snap_to_trading_day(ledger["valuta"], prices.index)
+        n_dropped = int(ledger["snap"].isna().sum())
+        if n_dropped:
+            warnings.warn(
+                f"[WARN] {n_dropped} cashflow ledger row(s) fall after the last "
+                "available price date and are skipped.",
+                stacklevel=2,
+            )
+        ledger = ledger.dropna(subset=["snap"])
+        for _, r in ledger.iterrows():
+            day = r["snap"]
+            cat = r["category"]
+            amt = float(r["amount_eur"])
+            if cat == "deposit":
+                deposits_by_day[day] = deposits_by_day.get(day, 0.0) + amt
+            elif cat == "withdrawal":
+                withdrawals_by_day[day] = withdrawals_by_day.get(day, 0.0) + amt
+            elif cat == "clearing_interest" and include_clearing_interest:
+                interest_by_day[day] = interest_by_day.get(day, 0.0) + amt
+            # trade_leg / distribution / thesaurierung / unclassified: no
+            # effect on cash here — already accounted for via the
+            # transactions file.
+
     # ── Main day loop ────────────────────────────────────────────────────────
     positions: dict[str, float] = {}   # ticker → shares (aggregate)
     cash = 0.0
     cumulative_invested = 0.0
+    cumulative_contributed = 0.0
     cash_flows: dict[pd.Timestamp, float] = {}
+    external_flows: dict[pd.Timestamp, float] = {}
     lot_ledger = LotLedger()
     tax_events: list[dict] = []
     cumulative_tax = 0.0
+    negative_cash_warned = False
     rows_out = []
 
     for day in prices.index:
         value_before_tx = cash + _mark_to_market(positions, prices, day, fx_rates, ticker_currency)
 
         day_invested = 0.0
+
+        # ── External cashflows (deposits, withdrawals, clearing interest) ───
+        if use_clearing:
+            dep = deposits_by_day.get(day, 0.0)
+            wdr = withdrawals_by_day.get(day, 0.0)
+            intr = interest_by_day.get(day, 0.0)
+            if dep:
+                cash += dep
+                cumulative_contributed += dep
+            if wdr:
+                cash += wdr  # withdrawals are stored as negative amounts
+                cumulative_contributed += wdr
+            if intr:
+                cash += intr
+            net_external = dep + wdr  # deposits − |withdrawals|
+            if net_external != 0:
+                external_flows[day] = external_flows.get(day, 0.0) + net_external
 
         # ── Thesaurierung events ────────────────────────────────────────────
         if day in thesSaur_by_date:
@@ -1617,12 +1952,26 @@ def reconstruct_portfolio(
 
                 px_eur = price_to_eur(px_native, cur, fx_used)
                 cost_eur = shares * px_eur  # positive = buy, negative = sell proceeds
+                # Off-broker assets (e.g. physical gold, crypto wallet) do
+                # not move money through the broker's clearing account.
+                # In clearing-account mode we treat them as in-kind
+                # contributions/withdrawals: they update positions and
+                # cumulative_contributed but never touch cash.
+                is_off = bool(tx.get("is_off_broker", False)) and use_clearing
 
                 if tx_type == "buy" or (tx_type not in ("sell",) and shares > 0):
-                    # External capital injection
-                    cash += cost_eur
+                    # Buy: gross invested volume always increases. Cash is
+                    # credited as a synthetic "external injection" only in
+                    # the legacy mode (no clearing-account ledger). When
+                    # the ledger is used the cash to fund this buy must
+                    # already have been deposited.
+                    if not use_clearing:
+                        cash += cost_eur
                     cumulative_invested += cost_eur
                     day_invested += cost_eur
+                    if is_off:
+                        cumulative_contributed += cost_eur
+                        external_flows[day] = external_flows.get(day, 0.0) + cost_eur
                     if run_tax:
                         lot_ledger.add_lot(Lot(
                             ticker=ticker,
@@ -1662,12 +2011,31 @@ def reconstruct_portfolio(
                                     "cumulative_tax": round(cumulative_tax, 4),
                                 })
                     day_invested += cost_eur   # negative
+                    if is_off:
+                        # In-kind withdrawal: cost_eur is negative, so this
+                        # decreases cumulative_contributed and external_flows.
+                        cumulative_contributed += cost_eur
+                        external_flows[day] = external_flows.get(day, 0.0) + cost_eur
 
-                cash -= cost_eur   # buy: nets to 0; sell: cash increases
+                if not is_off:
+                    cash -= cost_eur   # buy: nets to 0; sell: cash increases
                 positions[ticker] = positions.get(ticker, 0.0) + shares
 
-        if day_invested != 0:
+        if use_clearing:
+            # Benchmark / MWR consume real external flows (already
+            # accumulated above into external_flows[day]).
+            pass
+        elif day_invested != 0:
             cash_flows[day] = cash_flows.get(day, 0.0) + day_invested
+
+        if use_clearing and warn_on_negative_cash and cash < -1e-6 and not negative_cash_warned:
+            warnings.warn(
+                f"[WARN] Cash balance went negative on {day.date()} "
+                f"(EUR {cash:,.2f}); likely a settlement-date quirk where a "
+                "buy booked before its funding deposit. Continuing.",
+                stacklevel=2,
+            )
+            negative_cash_warned = True
 
         value_after_tx = cash + _mark_to_market(positions, prices, day, fx_rates, ticker_currency)
         cumulative_gain = value_after_tx - cumulative_invested
@@ -1678,13 +2046,24 @@ def reconstruct_portfolio(
             "portfolio_value": value_after_tx,
             "cash": cash,
             "cumulative_invested": cumulative_invested,
+            "cumulative_contributed": (
+                cumulative_contributed if use_clearing else cumulative_invested
+            ),
             "cumulative_gain": cumulative_gain,
         })
 
     result = pd.DataFrame(rows_out).set_index("date")
 
+    # When the clearing account drives flows, the benchmark mirrors real
+    # external deposits/withdrawals instead of trade-implied injections.
+    if use_clearing:
+        cash_flows = dict(external_flows)
+
     # Attach extra data as attributes
     result.cash_flows = pd.Series(cash_flows, name="cash_flow").sort_index()  # type: ignore[attr-defined]
+    result.external_flows = pd.Series(  # type: ignore[attr-defined]
+        external_flows, name="external_flow", dtype=float,
+    ).sort_index()
     result.lot_ledger = lot_ledger  # type: ignore[attr-defined]
     result.tax_timeline = (  # type: ignore[attr-defined]
         pd.DataFrame(tax_events).set_index("date") if tax_events else pd.DataFrame()
@@ -1780,6 +2159,74 @@ def compute_twr(value_after: pd.Series, value_before: pd.Series) -> pd.Series:
             prev_after = v_after if v_after > 0 else prev_after
 
     return twr
+
+
+# ---------------------------------------------------------------------------
+# 9b. Money-Weighted Return (XIRR)
+# ---------------------------------------------------------------------------
+
+def compute_xirr(
+    cash_flows: pd.Series,
+    final_value: float,
+    final_date: pd.Timestamp,
+) -> float | None:
+    """
+    Compute the money-weighted return (annualised XIRR) given external
+    cash flows and the terminal portfolio value.
+
+    Sign convention (from the investor's perspective):
+        deposit (money in)   → negative
+        withdrawal (money out) → positive
+        terminal value       → positive
+
+    The input `cash_flows` follows the model's convention
+    (deposit = +, withdrawal = −), so signs are flipped internally.
+
+    Returns the annualised IRR as a fraction (e.g. 0.07 = 7%/yr) or
+    None if the iteration fails to converge or the input is degenerate.
+    """
+    cf = cash_flows.dropna()
+    cf = cf[cf != 0.0]
+    if cf.empty or final_value <= 0:
+        return None
+
+    # Build (date, amount) list in investor sign convention.
+    items: list[tuple[pd.Timestamp, float]] = [
+        (d, -float(a)) for d, a in cf.items()
+    ]
+    items.append((final_date, float(final_value)))
+    items.sort(key=lambda x: x[0])
+
+    t0 = items[0][0]
+    years = np.array([(d - t0).days / 365.25 for d, _ in items], dtype=float)
+    amts = np.array([a for _, a in items], dtype=float)
+
+    # Newton-Raphson on f(r) = sum(a_i / (1+r)^t_i)
+    r = 0.05
+    for _ in range(120):
+        denom = (1.0 + r) ** years
+        f = float(np.sum(amts / denom))
+        df = float(np.sum(-years * amts / (denom * (1.0 + r))))
+        if not np.isfinite(f) or not np.isfinite(df) or abs(df) < 1e-14:
+            break
+        step = f / df
+        r_new = r - step
+        if not np.isfinite(r_new) or r_new <= -0.999:
+            r_new = (r - 0.999) / 2.0  # damp toward the lower bound
+        if abs(r_new - r) < 1e-9:
+            r = r_new
+            break
+        r = r_new
+
+    # Verify the residual is small; otherwise treat as non-convergence.
+    denom = (1.0 + r) ** years
+    if not np.all(np.isfinite(denom)):
+        return None
+    residual = float(np.sum(amts / denom))
+    scale = float(np.sum(np.abs(amts))) or 1.0
+    if abs(residual) / scale > 1e-4:
+        return None
+    return r
 
 
 # ---------------------------------------------------------------------------
@@ -2035,10 +2482,12 @@ def plot_performance(
     bm_metrics: dict,
     tax_timeline: Optional[pd.DataFrame] = None,
     show_tax: bool = False,
+    portfolio_twr_broker: Optional[pd.Series] = None,
 ) -> None:
     """
     Multi-panel chart:
-      Panel 1: TWR comparison (portfolio vs benchmark)
+      Panel 1: TWR comparison (portfolio vs benchmark, plus optional
+               broker-only TWR when off-broker assets exist)
       Panel 2: Stacked area — cumulative_invested vs cumulative_gain
       Panel 3: Rolling 1-year return
       Panel 4 (optional, if show_tax): cumulative tax paid
@@ -2054,13 +2503,23 @@ def plot_performance(
 
     # ── Panel 1: TWR ─────────────────────────────────────────────────────────
     ax_twr.plot(portfolio_twr.index, portfolio_twr.values,
-                label="Portfolio", linewidth=2)
+                label="Portfolio (incl. off-broker)" if portfolio_twr_broker is not None else "Portfolio",
+                linewidth=2)
+    if portfolio_twr_broker is not None:
+        clean = portfolio_twr_broker.dropna()
+        if not clean.empty:
+            ax_twr.plot(clean.index, clean.values,
+                        label="Portfolio (broker-only)",
+                        linewidth=1.8, linestyle="-.", color="#7f3fbf")
     bm_label = f"Benchmark ({benchmark_ticker})"
     bm_label += " [buy-and-hold]" if buy_and_hold else " [mirror flows]"
     ax_twr.plot(benchmark_twr.index, benchmark_twr.values,
                 label=bm_label, linewidth=2, linestyle="--")
     ax_twr.axhline(1.0, color="grey", linewidth=0.8, linestyle=":")
-    ax_twr.set_title("Portfolio vs Benchmark — Time-Weighted Return (TWR)", fontsize=13)
+    title = "Portfolio vs Benchmark — Time-Weighted Return (TWR)"
+    if portfolio_twr_broker is not None:
+        title += "\nBroker-only excludes assets held outside the broker (e.g. physical metals, crypto wallets)"
+    ax_twr.set_title(title, fontsize=13)
     ax_twr.set_ylabel("TWR Index (start = 1.0)")
     ax_twr.legend()
 
@@ -2152,6 +2611,31 @@ def main(argv: list[str] | None = None) -> None:
         manual_txs = load_manual_transactions(args.manual_transactions)
         transactions = pd.concat([transactions, manual_txs], ignore_index=True)
         transactions = transactions.sort_values("date").reset_index(drop=True)
+
+    # ── Load clearing-account ledger (optional) ──────────────────────────────
+    cashflow_ledger: Optional[pd.DataFrame] = None
+    ca_cfg = app_config.clearing_account
+    if ca_cfg.use_clearing_account:
+        ledger_path = Path(ca_cfg.path)
+        if not ledger_path.is_absolute():
+            ledger_path = (Path(__file__).resolve().parent / ledger_path)
+        if ledger_path.exists():
+            cashflow_ledger = load_cashflow_ledger(
+                ledger_path,
+                reference_iban_suffix=ca_cfg.reference_iban_suffix,
+                verbose=args.verbose,
+            )
+            reconcile_cashflow_with_transactions(
+                cashflow_ledger, transactions, verbose=args.verbose,
+            )
+        else:
+            warnings.warn(
+                f"[WARN] clearing_account.use_clearing_account is true but "
+                f"{ledger_path} was not found; falling back to legacy "
+                "cash model (buys treated as external injections, no "
+                "withdrawals).",
+                stacklevel=2,
+            )
 
     # ── Load lookup file ─────────────────────────────────────────────────────
     if args.lookup_file is not None:
@@ -2251,6 +2735,9 @@ def main(argv: list[str] | None = None) -> None:
         portfolio_df = reconstruct_portfolio(
             transactions, isin_to_ticker, isin_to_currency,
             prices, fx_rates, run_tax=False, verbose=args.verbose,
+            cashflow_ledger=cashflow_ledger,
+            include_clearing_interest=ca_cfg.include_clearing_interest,
+            warn_on_negative_cash=ca_cfg.warn_on_negative_cash,
         )
         holdings = build_holdings_table(
             portfolio_df.final_positions,  # type: ignore[attr-defined]
@@ -2273,8 +2760,27 @@ def main(argv: list[str] | None = None) -> None:
         prices, fx_rates,
         run_tax=args.tax,
         verbose=args.verbose,
+        cashflow_ledger=cashflow_ledger,
+        include_clearing_interest=ca_cfg.include_clearing_interest,
+        warn_on_negative_cash=ca_cfg.warn_on_negative_cash,
     )
     cash_flows: pd.Series = portfolio_df.cash_flows  # type: ignore[attr-defined]
+
+    # ── Optional broker-only reconstruction (excludes off-broker assets) ────
+    has_off_broker = bool(transactions.get("is_off_broker", pd.Series(dtype=bool)).any())
+    portfolio_df_broker: Optional[pd.DataFrame] = None
+    if has_off_broker:
+        broker_only_txs = transactions[~transactions["is_off_broker"].astype(bool)].copy()
+        if not broker_only_txs.empty:
+            portfolio_df_broker = reconstruct_portfolio(
+                broker_only_txs, isin_to_ticker, isin_to_currency,
+                prices, fx_rates,
+                run_tax=False,
+                verbose=False,
+                cashflow_ledger=cashflow_ledger,
+                include_clearing_interest=ca_cfg.include_clearing_interest,
+                warn_on_negative_cash=False,
+            )
 
     # ── Benchmark simulation ─────────────────────────────────────────────────
     benchmark_df = simulate_benchmark(cash_flows, prices[args.benchmark], args.buy_and_hold)
@@ -2282,6 +2788,12 @@ def main(argv: list[str] | None = None) -> None:
     # ── TWR ──────────────────────────────────────────────────────────────────
     pv_twr = compute_twr(portfolio_df["portfolio_value"], portfolio_df["value_before_tx"])
     bv_twr = compute_twr(benchmark_df["benchmark_value"], benchmark_df["value_before_tx"])
+    pv_twr_broker: Optional[pd.Series] = None
+    if portfolio_df_broker is not None:
+        pv_twr_broker = compute_twr(
+            portfolio_df_broker["portfolio_value"],
+            portfolio_df_broker["value_before_tx"],
+        )
 
     common_idx = pv_twr.dropna().index.intersection(bv_twr.dropna().index)
     if common_idx.empty:
@@ -2292,6 +2804,13 @@ def main(argv: list[str] | None = None) -> None:
 
     pv_twr = pv_twr / pv_twr.iloc[0]
     bv_twr = bv_twr / bv_twr.iloc[0]
+
+    if pv_twr_broker is not None:
+        pv_twr_broker = pv_twr_broker.reindex(common_idx)
+        first_valid = pv_twr_broker.dropna()
+        pv_twr_broker = (
+            pv_twr_broker / first_valid.iloc[0] if not first_valid.empty else pv_twr_broker
+        )
 
     # ── Verbose diagnostics ──────────────────────────────────────────────────
     if args.verbose:
@@ -2336,8 +2855,12 @@ def main(argv: list[str] | None = None) -> None:
         print("=" * 70 + "\n")
 
     # ── Metrics ──────────────────────────────────────────────────────────────
-    pm = compute_metrics(pv_twr, "Portfolio")
+    pf_label = "Portfolio (incl. off-broker)" if pv_twr_broker is not None else "Portfolio"
+    pm = compute_metrics(pv_twr, pf_label)
     bm = compute_metrics(bv_twr, f"Benchmark ({args.benchmark})")
+    pm_broker: dict = {}
+    if pv_twr_broker is not None and not pv_twr_broker.dropna().empty:
+        pm_broker = compute_metrics(pv_twr_broker.dropna(), "Portfolio (broker-only)")
 
     # Benchmark correlation
     pf_ret = pv_twr.pct_change().dropna()
@@ -2351,11 +2874,25 @@ def main(argv: list[str] | None = None) -> None:
         pm["benchmark_correlation"] = "n/a"
         bm["benchmark_correlation"] = "n/a"
 
+    if pm_broker:
+        pf_b_ret = pv_twr_broker.dropna().pct_change().dropna()
+        common_b = pf_b_ret.index.intersection(bm_ret.index)
+        if len(common_b) > 1:
+            pm_broker["benchmark_correlation"] = round(
+                pf_b_ret.loc[common_b].corr(bm_ret.loc[common_b]), 4
+            )
+        else:
+            pm_broker["benchmark_correlation"] = "n/a"
+
     # ── Performance summary ──────────────────────────────────────────────────
     print("\n" + "=" * 66)
     print("  PERFORMANCE SUMMARY  (Time-Weighted Return)")
     print("=" * 66)
-    for metrics in (pm, bm):
+    summary_metrics = [pm]
+    if pm_broker:
+        summary_metrics.append(pm_broker)
+    summary_metrics.append(bm)
+    for metrics in summary_metrics:
         print(f"\n  {metrics['label']}")
         print(f"    Period               : {metrics['start_date']} → {metrics['end_date']}")
         print(f"    Trading days         : {metrics['trading_days']}")
@@ -2393,10 +2930,30 @@ def main(argv: list[str] | None = None) -> None:
     last_gain = portfolio_df["cumulative_gain"].iloc[-1]
     gain_pct = last_gain / last_invested * 100 if last_invested > 0 else 0.0
 
-    print(f"\n  Capital invested : EUR {last_invested:,.2f}")
-    print(f"  Portfolio value  : EUR {last_value:,.2f}")
-    print(f"  Total gain/loss  : EUR {last_gain:,.2f} ({gain_pct:.2f}%)")
-    print(f"  Cash held        : EUR {portfolio_df['cash'].iloc[-1]:,.2f}")
+    print(f"\n  Capital invested (gross) : EUR {last_invested:,.2f}")
+    print(f"  Portfolio value          : EUR {last_value:,.2f}")
+    print(f"  Total gain/loss          : EUR {last_gain:,.2f} ({gain_pct:.2f}%)")
+    print(f"  Cash held                : EUR {portfolio_df['cash'].iloc[-1]:,.2f}")
+
+    if cashflow_ledger is not None:
+        last_contributed = float(portfolio_df["cumulative_contributed"].iloc[-1])
+        net_gain = float(last_value) - last_contributed
+        net_gain_pct = (net_gain / last_contributed * 100) if last_contributed > 0 else 0.0
+        print(f"  Net contributed          : EUR {last_contributed:,.2f}")
+        print(f"    (deposits − withdrawals; net of clearing-account flows)")
+        print(f"  Total return on net      : EUR {net_gain:,.2f} ({net_gain_pct:.2f}%)")
+
+        external_flows: pd.Series = portfolio_df.external_flows  # type: ignore[attr-defined]
+        if not external_flows.empty:
+            mwr = compute_xirr(
+                external_flows,
+                final_value=float(last_value),
+                final_date=portfolio_df.index[-1],
+            )
+            if mwr is not None:
+                print(f"  Money-weighted return    : {mwr * 100:>8.2f} %/yr (XIRR)")
+            else:
+                print(f"  Money-weighted return    : n/a (failed to converge)")
 
     # ── Tax simulation output ────────────────────────────────────────────────
     if args.tax:
@@ -2408,7 +2965,9 @@ def main(argv: list[str] | None = None) -> None:
             "portfolio_twr": pv_twr,
             "benchmark_twr": bv_twr,
             "cumulative_invested": portfolio_df["cumulative_invested"],
+            "cumulative_contributed": portfolio_df["cumulative_contributed"],
             "portfolio_value_eur": portfolio_df["portfolio_value"],
+            "cash_eur": portfolio_df["cash"],
             "cumulative_gain": portfolio_df["cumulative_gain"],
         })
         out.to_csv(args.export_csv)
@@ -2421,6 +2980,7 @@ def main(argv: list[str] | None = None) -> None:
             portfolio_df, pm, bm,
             tax_timeline=portfolio_df.tax_timeline,  # type: ignore[attr-defined]
             show_tax=args.tax,
+            portfolio_twr_broker=pv_twr_broker,
         )
 
 
